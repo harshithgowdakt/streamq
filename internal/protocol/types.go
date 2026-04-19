@@ -24,24 +24,24 @@ const (
 
 // Error codes
 const (
-	ErrNone               int16 = 0
-	ErrUnknown            int16 = -1
-	ErrOffsetOutOfRange   int16 = 1
-	ErrCorruptMessage     int16 = 2
-	ErrUnknownTopicOrPart int16 = 3
-	ErrInvalidMessage     int16 = 4
+	ErrNone                         int16 = 0
+	ErrUnknown                      int16 = -1
+	ErrOffsetOutOfRange             int16 = 1
+	ErrCorruptMessage               int16 = 2
+	ErrUnknownTopicOrPart           int16 = 3
+	ErrInvalidMessage               int16 = 4
 	ErrGroupCoordinatorNotAvailable int16 = 15
-	ErrNotCoordinator     int16 = 16
-	ErrNotLeaderForPartition int16 = 6
-	ErrRequestTimedOut       int16 = 7
-	ErrNotEnoughReplicas     int16 = 19
-	ErrIllegalGeneration         int16 = 22
-	ErrInconsistentGroupProtocol int16 = 23
-	ErrUnknownMemberID           int16 = 25
-	ErrRebalanceInProgress       int16 = 27
-	ErrUnsupportedVersion        int16 = 35
-	ErrTopicAlreadyExists        int16 = 36
-	ErrInvalidPartitions         int16 = 37
+	ErrNotCoordinator               int16 = 16
+	ErrNotLeaderForPartition        int16 = 6
+	ErrRequestTimedOut              int16 = 7
+	ErrNotEnoughReplicas            int16 = 19
+	ErrIllegalGeneration            int16 = 22
+	ErrInconsistentGroupProtocol    int16 = 23
+	ErrUnknownMemberID              int16 = 25
+	ErrRebalanceInProgress          int16 = 27
+	ErrUnsupportedVersion           int16 = 35
+	ErrTopicAlreadyExists           int16 = 36
+	ErrInvalidPartitions            int16 = 37
 )
 
 // RequestHeader is the common header for all requests.
@@ -89,9 +89,9 @@ type ProduceTopicResponse struct {
 }
 
 type ProducePartitionResponse struct {
-	Partition      int32
-	ErrorCode      int16
-	BaseOffset     int64
+	Partition       int32
+	ErrorCode       int16
+	BaseOffset      int64
 	LogAppendTimeMs int64 // v2+
 }
 
@@ -202,10 +202,10 @@ type ApiVersionsRequest struct {
 }
 
 type ApiVersionsResponse struct {
-	Header       ResponseHeader
-	Version      int16
-	ErrorCode    int16
-	ApiVersions  []ApiVersionRange
+	Header      ResponseHeader
+	Version     int16
+	ErrorCode   int16
+	ApiVersions []ApiVersionRange
 }
 
 type ApiVersionRange struct {
@@ -252,17 +252,17 @@ type ListOffsetsPartitionResponse struct {
 // --- FindCoordinator ---
 
 type FindCoordinatorRequest struct {
-	Header RequestHeader
-	Key    string // group id
-	KeyType int8  // 0=group, 1=transactional
+	Header  RequestHeader
+	Key     string // group id
+	KeyType int8   // 0=group, 1=transactional
 }
 
 type FindCoordinatorResponse struct {
-	Header      ResponseHeader
-	ErrorCode   int16
-	NodeID      int32
-	Host        string
-	Port        int32
+	Header    ResponseHeader
+	ErrorCode int16
+	NodeID    int32
+	Host      string
+	Port      int32
 }
 
 // --- JoinGroup ---
@@ -680,7 +680,7 @@ func DecodeRequest(data []byte) (interface{}, error) {
 			// Read and skip configs
 			numConfigs := dec.ReadInt32()
 			for c := int32(0); c < numConfigs && dec.Err() == nil; c++ {
-				_ = dec.ReadString() // key
+				_ = dec.ReadString()         // key
 				_ = dec.ReadNullableString() // value
 			}
 		}

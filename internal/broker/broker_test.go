@@ -238,8 +238,12 @@ func TestMetadata(t *testing.T) {
 		Header: protocol.RequestHeader{CorrelationID: 20},
 	})
 
-	if len(resp.Topics) != 2 {
-		t.Fatalf("expected 2 topics, got %d", len(resp.Topics))
+	names := make(map[string]bool, len(resp.Topics))
+	for _, tm := range resp.Topics {
+		names[tm.Topic] = true
+	}
+	if !names["t1"] || !names["t2"] {
+		t.Fatalf("expected t1 and t2 in topics, got %v", names)
 	}
 
 	// Get specific topic

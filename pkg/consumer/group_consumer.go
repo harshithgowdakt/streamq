@@ -41,11 +41,12 @@ func DefaultGroupConfig() GroupConfig {
 type GroupConsumer struct {
 	config       GroupConfig
 	conn         net.Conn
-	mu           sync.Mutex
+	sendMu       sync.Mutex // serializes wire protocol use
+	mu           sync.Mutex // guards member state
 	memberID     string
 	generationID int32
-	assignments  map[string][]int32          // topic -> partitions
-	offsets      map[string]map[int32]int64  // topic -> partition -> next fetch offset
+	assignments  map[string][]int32         // topic -> partitions
+	offsets      map[string]map[int32]int64 // topic -> partition -> next fetch offset
 	topics       []string
 	corrID       int32
 
@@ -73,12 +74,61 @@ func NewGroupConsumer(config GroupConfig) (*GroupConsumer, error) {
 	return gc, nil
 }
 
+// CurrentOffsets returns a snapshot of the next-fetch offsets.
+func (gc *GroupConsumer) CurrentOffsets() map[string]map[int32]int64 {
+	gc.mu.Lock()
+	defer gc.mu.Unlock()
+	out := make(map[string]map[int32]int64, len(gc.offsets))
+	for t, parts := range gc.offsets {
+		cp := make(map[int32]int64, len(parts))
+		for p, o := range parts {
+			cp[p] = o
+		}
+		out[t] = cp
+	}
+	return out
+}
+
+// Assignments returns a snapshot of the current partition assignment.
+func (gc *GroupConsumer) Assignments() map[string][]int32 {
+	gc.mu.Lock()
+	defer gc.mu.Unlock()
+	out := make(map[string][]int32, len(gc.assignments))
+	for t, parts := range gc.assignments {
+		cp := make([]int32, len(parts))
+		copy(cp, parts)
+		out[t] = cp
+	}
+	return out
+}
+
 // Subscribe sets the topics and joins the consumer group.
 func (gc *GroupConsumer) Subscribe(topics ...string) error {
 	gc.mu.Lock()
 	gc.topics = topics
 	gc.mu.Unlock()
 
+	if err := gc.joinGroup(); err != nil {
+		return err
+	}
+
+	// Start heartbeat goroutine
+	gc.heartbeatWg.Add(1)
+	go gc.heartbeatLoop()
+
+	// Start auto-commit goroutine if enabled
+	if gc.config.AutoCommitInterval > 0 {
+		gc.commitWg.Add(1)
+		go gc.autoCommitLoop()
+	}
+	return nil
+}
+
+// joinGroupRetry retries joinGroup up to a few times.
+func (gc *GroupConsumer) joinGroupRetry(attempt int) error {
+	if attempt > 5 {
+		return fmt.Errorf("join group: exceeded max retries")
+	}
 	return gc.joinGroup()
 }
 
@@ -160,6 +210,11 @@ func (gc *GroupConsumer) joinGroup() error {
 	}
 
 	sr := syncResp.(*protocol.SyncGroupResponse)
+	if sr.ErrorCode == protocol.ErrRebalanceInProgress || sr.ErrorCode == protocol.ErrIllegalGeneration {
+		// Another rebalance started while we were syncing. Re-join.
+		time.Sleep(200 * time.Millisecond)
+		return gc.joinGroupRetry(0)
+	}
 	if sr.ErrorCode != protocol.ErrNone {
 		return fmt.Errorf("sync group error: %d", sr.ErrorCode)
 	}
@@ -178,16 +233,6 @@ func (gc *GroupConsumer) joinGroup() error {
 	// Fetch committed offsets
 	if err := gc.fetchCommittedOffsets(); err != nil {
 		return fmt.Errorf("fetch offsets: %w", err)
-	}
-
-	// Start heartbeat goroutine
-	gc.heartbeatWg.Add(1)
-	go gc.heartbeatLoop()
-
-	// Start auto-commit goroutine if enabled
-	if gc.config.AutoCommitInterval > 0 {
-		gc.commitWg.Add(1)
-		go gc.autoCommitLoop()
 	}
 
 	return nil
@@ -581,9 +626,8 @@ func (gc *GroupConsumer) heartbeatLoop() {
 
 			hr := resp.(*protocol.HeartbeatResponse)
 			if hr.ErrorCode == protocol.ErrRebalanceInProgress {
-				// Need to rejoin
+				// Rejoin in place — heartbeat loop keeps running
 				gc.joinGroup()
-				return
 			}
 		}
 	}
@@ -597,8 +641,6 @@ func (gc *GroupConsumer) autoCommitLoop() {
 	for {
 		select {
 		case <-gc.closed:
-			// Final commit on close
-			gc.CommitSync()
 			return
 		case <-ticker.C:
 			gc.CommitSync()
@@ -612,12 +654,11 @@ func (gc *GroupConsumer) Close() error {
 		close(gc.closed)
 	})
 
-	gc.heartbeatWg.Wait()
-	gc.commitWg.Wait()
-
-	// Leave group
+	// Send LeaveGroup before stopping goroutines so the coordinator learns quickly.
 	gc.mu.Lock()
-	if gc.memberID != "" {
+	memberID := gc.memberID
+	gc.mu.Unlock()
+	if memberID != "" {
 		leaveReq := &protocol.LeaveGroupRequest{
 			Header: protocol.RequestHeader{
 				APIKey:        protocol.APIKeyLeaveGroup,
@@ -626,15 +667,17 @@ func (gc *GroupConsumer) Close() error {
 				ClientID:      gc.config.ClientID,
 			},
 			GroupID:  gc.config.GroupID,
-			MemberID: gc.memberID,
+			MemberID: memberID,
 		}
-		gc.mu.Unlock()
 		gc.sendRequest(leaveReq)
-	} else {
-		gc.mu.Unlock()
 	}
 
-	return gc.conn.Close()
+	// Close connection — unblocks any in-flight reads in heartbeat/commit loops.
+	gc.conn.Close()
+
+	gc.heartbeatWg.Wait()
+	gc.commitWg.Wait()
+	return nil
 }
 
 func (gc *GroupConsumer) sendRequest(req interface{}) (interface{}, error) {
@@ -647,9 +690,9 @@ func (gc *GroupConsumer) sendRequest(req interface{}) (interface{}, error) {
 	binary.BigEndian.PutUint32(frame, uint32(len(data)))
 	copy(frame[4:], data)
 
-	gc.mu.Lock()
+	gc.sendMu.Lock()
+	defer gc.sendMu.Unlock()
 	conn := gc.conn
-	gc.mu.Unlock()
 
 	if _, err := conn.Write(frame); err != nil {
 		return nil, err

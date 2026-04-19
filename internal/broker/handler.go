@@ -405,8 +405,8 @@ func (b *Broker) HandleCreateTopics(req *protocol.CreateTopicsRequest) *protocol
 // HandleApiVersions returns supported API version ranges.
 func (b *Broker) HandleApiVersions(req *protocol.ApiVersionsRequest) *protocol.ApiVersionsResponse {
 	return &protocol.ApiVersionsResponse{
-		Header:  protocol.ResponseHeader{CorrelationID: req.Header.CorrelationID},
-		Version: req.Header.APIVersion,
+		Header:    protocol.ResponseHeader{CorrelationID: req.Header.CorrelationID},
+		Version:   req.Header.APIVersion,
 		ErrorCode: protocol.ErrNone,
 		ApiVersions: []protocol.ApiVersionRange{
 			{APIKey: protocol.APIKeyProduce, MinVersion: 0, MaxVersion: 3},

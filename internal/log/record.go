@@ -28,9 +28,9 @@ type Record struct {
 //	  ValueLen    int32   (4)  — -1 means nil
 //	  Value       []byte
 type RecordBatch struct {
-	BaseOffset  int64
-	Attributes  int16
-	Records     []Record
+	BaseOffset int64
+	Attributes int16
+	Records    []Record
 }
 
 const (
@@ -45,7 +45,7 @@ func (b *RecordBatch) Encode() []byte {
 		bodySize += 4 + len(r.Key) + 4 + len(r.Value)
 	}
 
-	batchLength := 4 + bodySize // CRC(4) + body
+	batchLength := 4 + bodySize      // CRC(4) + body
 	totalSize := 8 + 4 + batchLength // BaseOffset(8) + BatchLength(4) + batchLength
 
 	buf := make([]byte, totalSize)

@@ -8,9 +8,9 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/harshithgowda/streamq/internal/cluster"
 	"github.com/hashicorp/raft"
 	raftboltdb "github.com/hashicorp/raft-boltdb/v2"
-	"github.com/harshithgowda/streamq/internal/cluster"
 )
 
 // Config holds controller configuration.

@@ -21,8 +21,8 @@ type PartitionState struct {
 	mu            sync.RWMutex
 	Role          PartitionRole
 	Epoch         int32
-	LEO           int64                      // = CommitLog.NextOffset
-	HWM           int64                      // = min(LEO across ISR)
+	LEO           int64 // = CommitLog.NextOffset
+	HWM           int64 // = min(LEO across ISR)
 	ISR           []cluster.BrokerID
 	ReplicaLEOs   map[cluster.BrokerID]int64 // leader tracks follower LEOs
 	ReplicaLastMs map[cluster.BrokerID]int64 // last fetch time per follower

@@ -26,8 +26,8 @@ type BrokerInfo struct {
 // ClusterMetadata is the full cluster state managed by the controller via Raft.
 type ClusterMetadata struct {
 	Brokers      map[BrokerID]BrokerInfo          `json:"brokers"`
-	Assignments  map[string][]PartitionAssignment  `json:"assignments"` // topic -> partitions
-	NextBrokerID BrokerID                          `json:"next_broker_id"`
+	Assignments  map[string][]PartitionAssignment `json:"assignments"` // topic -> partitions
+	NextBrokerID BrokerID                         `json:"next_broker_id"`
 }
 
 // NewClusterMetadata creates an empty ClusterMetadata.

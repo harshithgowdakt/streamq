@@ -14,11 +14,11 @@ import (
 type GroupState int
 
 const (
-	GroupStateEmpty              GroupState = 0
-	GroupStatePreparingRebalance GroupState = 1
+	GroupStateEmpty               GroupState = 0
+	GroupStatePreparingRebalance  GroupState = 1
 	GroupStateCompletingRebalance GroupState = 2
-	GroupStateStable             GroupState = 3
-	GroupStateDead               GroupState = 4
+	GroupStateStable              GroupState = 3
+	GroupStateDead                GroupState = 4
 )
 
 // MemberMetadata holds state for a consumer group member.
@@ -47,84 +47,37 @@ type ConsumerGroup struct {
 	Offsets        map[string]map[int32]OffsetAndMetadata
 }
 
-// GroupCoordinator manages consumer groups.
+// GroupCoordinator manages consumer groups. All offset state is durably
+// stored in the __consumer_offsets topic; the in-memory map is just a cache
+// rebuilt from that log at startup.
 type GroupCoordinator struct {
-	mu          sync.RWMutex
-	groups      map[string]*ConsumerGroup
-	broker      *Broker
-	offsetStore *OffsetStore
-
-	flushStop chan struct{}
-	flushWg   sync.WaitGroup
+	mu     sync.RWMutex
+	groups map[string]*ConsumerGroup
+	broker *Broker
 }
 
-// NewGroupCoordinator creates a new GroupCoordinator.
+// NewGroupCoordinator creates a new GroupCoordinator. The __consumer_offsets
+// topic is bootstrapped lazily via Start(), after topic management is ready.
 func NewGroupCoordinator(broker *Broker) *GroupCoordinator {
-	gc := &GroupCoordinator{
-		groups:      make(map[string]*ConsumerGroup),
-		broker:      broker,
-		offsetStore: NewOffsetStore(broker.Config.DataDir),
-		flushStop:   make(chan struct{}),
-	}
-
-	// Start periodic offset flush
-	gc.flushWg.Add(1)
-	go gc.flushLoop()
-
-	return gc
-}
-
-func (gc *GroupCoordinator) flushLoop() {
-	defer gc.flushWg.Done()
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ticker.C:
-			gc.flushAllOffsets()
-		case <-gc.flushStop:
-			gc.flushAllOffsets()
-			return
-		}
+	return &GroupCoordinator{
+		groups: make(map[string]*ConsumerGroup),
+		broker: broker,
 	}
 }
 
-func (gc *GroupCoordinator) flushAllOffsets() {
-	gc.mu.RLock()
-	groups := make([]*ConsumerGroup, 0, len(gc.groups))
-	for _, g := range gc.groups {
-		groups = append(groups, g)
+// Start ensures the __consumer_offsets topic exists and replays committed
+// offsets into memory. Must be called after TopicManager is ready and, in
+// cluster mode, after the broker has joined the cluster.
+func (gc *GroupCoordinator) Start() {
+	if err := gc.ensureOffsetsTopic(); err != nil {
+		log.Printf("group coordinator: ensure offsets topic: %v", err)
 	}
-	gc.mu.RUnlock()
-
-	for _, g := range groups {
-		g.mu.Lock()
-		if len(g.Offsets) > 0 {
-			// Copy offsets under lock
-			offsets := make(map[string]map[int32]OffsetAndMetadata)
-			for t, parts := range g.Offsets {
-				pm := make(map[int32]OffsetAndMetadata)
-				for p, om := range parts {
-					pm[p] = om
-				}
-				offsets[t] = pm
-			}
-			g.mu.Unlock()
-			if err := gc.offsetStore.Save(g.GroupID, offsets); err != nil {
-				log.Printf("error flushing offsets for group %s: %v", g.GroupID, err)
-			}
-		} else {
-			g.mu.Unlock()
-		}
-	}
+	gc.loadOffsetsFromLog()
 }
 
-// Close stops the coordinator and flushes offsets.
-func (gc *GroupCoordinator) Close() {
-	close(gc.flushStop)
-	gc.flushWg.Wait()
-}
+// Close stops the coordinator. Offsets are already durable in
+// __consumer_offsets, so there's nothing to flush here.
+func (gc *GroupCoordinator) Close() {}
 
 func (gc *GroupCoordinator) getOrCreateGroup(groupID string) *ConsumerGroup {
 	gc.mu.Lock()
@@ -139,10 +92,6 @@ func (gc *GroupCoordinator) getOrCreateGroup(groupID string) *ConsumerGroup {
 			PendingMembers: make(map[string]chan *protocol.JoinGroupResponse),
 			syncBarrier:    make(map[string]chan []byte),
 			Offsets:        make(map[string]map[int32]OffsetAndMetadata),
-		}
-		// Load persisted offsets
-		if offsets, err := gc.offsetStore.Load(groupID); err == nil && offsets != nil {
-			g.Offsets = offsets
 		}
 		gc.groups[groupID] = g
 	}
@@ -220,22 +169,32 @@ func (gc *GroupCoordinator) HandleJoinGroup(req *protocol.JoinGroupRequest) *pro
 	group.PendingMembers[memberID] = ch
 
 	// Trigger rebalance
+	wasEmpty := group.State == GroupStateEmpty
 	if group.State == GroupStateStable || group.State == GroupStateEmpty || group.State == GroupStateCompletingRebalance {
 		group.State = GroupStatePreparingRebalance
 
-		// Start a rebalance timer
-		rebalanceTimeout := req.RebalanceTimeoutMs
-		if rebalanceTimeout <= 0 {
-			rebalanceTimeout = 10000
+		// Schedule a rebalance completion timer. On first rebalance from Empty, wait
+		// a short initial delay to absorb simultaneous joiners (like Kafka's
+		// group.initial.rebalance.delay.ms). Otherwise use the rebalance timeout.
+		var delay time.Duration
+		if wasEmpty {
+			delay = 500 * time.Millisecond
+		} else {
+			rebalanceTimeout := req.RebalanceTimeoutMs
+			if rebalanceTimeout <= 0 {
+				rebalanceTimeout = 10000
+			}
+			delay = time.Duration(rebalanceTimeout) * time.Millisecond
 		}
-		// Schedule rebalance completion
-		time.AfterFunc(time.Duration(rebalanceTimeout)*time.Millisecond, func() {
+		time.AfterFunc(delay, func() {
 			gc.tryCompleteJoin(group)
 		})
 	}
 
-	// If all known members have joined, complete immediately
-	if gc.allMembersJoined(group) {
+	// Don't auto-complete from Empty — always wait for initial rebalance delay so
+	// late joiners can participate in the same generation. For subsequent
+	// rebalances, complete immediately if everyone has rejoined.
+	if !wasEmpty && gc.allMembersJoined(group) {
 		gc.doCompleteJoin(group)
 		group.mu.Unlock()
 	} else {
@@ -553,8 +512,7 @@ func (gc *GroupCoordinator) HandleHeartbeat(req *protocol.HeartbeatRequest) *pro
 		}
 	}
 
-	// Reset session timer
-	gc.resetSessionTimer(group, req.MemberID)
+	gc.resetSessionTimerLocked(group, req.MemberID)
 
 	return &protocol.HeartbeatResponse{
 		Header:    protocol.ResponseHeader{CorrelationID: req.Header.CorrelationID},
@@ -565,7 +523,11 @@ func (gc *GroupCoordinator) HandleHeartbeat(req *protocol.HeartbeatRequest) *pro
 func (gc *GroupCoordinator) resetSessionTimer(group *ConsumerGroup, memberID string) {
 	group.mu.Lock()
 	defer group.mu.Unlock()
+	gc.resetSessionTimerLocked(group, memberID)
+}
 
+// resetSessionTimerLocked must be called with group.mu held.
+func (gc *GroupCoordinator) resetSessionTimerLocked(group *ConsumerGroup, memberID string) {
 	member, ok := group.Members[memberID]
 	if !ok {
 		return
@@ -712,15 +674,49 @@ func (gc *GroupCoordinator) HandleOffsetCommit(req *protocol.OffsetCommitRequest
 		Header: protocol.ResponseHeader{CorrelationID: req.Header.CorrelationID},
 	}
 
+	now := time.Now().UnixMilli()
 	for _, t := range req.Topics {
 		tr := protocol.OffsetCommitTopicResponse{Topic: t.Topic}
 		for _, p := range t.Partitions {
-			if group.Offsets[t.Topic] == nil {
-				group.Offsets[t.Topic] = make(map[int32]OffsetAndMetadata)
-			}
 			metadata := ""
 			if p.Metadata != nil {
 				metadata = *p.Metadata
+			}
+
+			// Write to __consumer_offsets first. Only acknowledge success to
+			// the client after the record is durable. If this fails, report
+			// an error and leave the in-memory map untouched so the client
+			// retries — we must never tell a client we committed when we
+			// didn't.
+			key := encodeOffsetKey(offsetCommitKey{
+				GroupID:   req.GroupID,
+				Topic:     t.Topic,
+				Partition: p.Partition,
+			})
+			val := encodeOffsetValue(offsetCommitValue{
+				Offset:    p.Offset,
+				Metadata:  metadata,
+				Timestamp: now,
+			})
+
+			// Release group.mu while we hit the log so we don't hold the
+			// group lock during disk I/O.
+			group.mu.Unlock()
+			appendErr := gc.appendOffsetRecord(req.GroupID, key, val)
+			group.mu.Lock()
+
+			if appendErr != nil {
+				log.Printf("offset commit for %s/%s-%d failed: %v",
+					req.GroupID, t.Topic, p.Partition, appendErr)
+				tr.Partitions = append(tr.Partitions, protocol.OffsetCommitPartitionResponse{
+					Partition: p.Partition,
+					ErrorCode: protocol.ErrUnknown,
+				})
+				continue
+			}
+
+			if group.Offsets[t.Topic] == nil {
+				group.Offsets[t.Topic] = make(map[int32]OffsetAndMetadata)
 			}
 			group.Offsets[t.Topic][p.Partition] = OffsetAndMetadata{
 				Offset:   p.Offset,

@@ -59,11 +59,11 @@ type partitionKey struct {
 
 // Producer batches messages and sends them to the broker.
 type Producer struct {
-	config  Config
-	conn    net.Conn
-	mu      sync.Mutex
-	closed  atomic.Bool
-	corrID  int32
+	config Config
+	conn   net.Conn
+	mu     sync.Mutex
+	closed atomic.Bool
+	corrID int32
 
 	// Accumulator: per topic-partition buffer
 	accMu   sync.Mutex

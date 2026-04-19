@@ -150,11 +150,11 @@ func (rf *ReplicaFetcher) doFetch() error {
 			CorrelationID: int32(time.Now().UnixNano() & 0x7FFFFFFF),
 			ClientID:      fmt.Sprintf("replica-%d", rf.broker.GetNodeID()),
 		},
-		ReplicaID:  rf.broker.GetNodeID(),
-		MaxWaitMs:  500,
-		MinBytes:   1,
-		MaxBytes:   10 * 1024 * 1024,
-		Topics:     topics,
+		ReplicaID: rf.broker.GetNodeID(),
+		MaxWaitMs: 500,
+		MinBytes:  1,
+		MaxBytes:  10 * 1024 * 1024,
+		Topics:    topics,
 	}
 
 	// Encode and send

@@ -16,9 +16,9 @@ type ConsumerProtocolSubscription struct {
 // ConsumerProtocolAssignment is the assignment embedded in SyncGroup assignment bytes.
 // Wire format: version(int16), topic_count(int32), [topic(string), partition_count(int32), partitions(int32...)...], user_data(bytes)
 type ConsumerProtocolAssignment struct {
-	Version          int16
+	Version           int16
 	PartitionsByTopic map[string][]int32
-	UserData         []byte
+	UserData          []byte
 }
 
 // EncodeConsumerSubscription encodes a subscription to Kafka wire format bytes.

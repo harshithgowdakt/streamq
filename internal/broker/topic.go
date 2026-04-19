@@ -2,7 +2,10 @@ package broker
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/harshithgowda/streamq/internal/log"
@@ -22,18 +25,75 @@ type Topic struct {
 
 // TopicManager manages topics and their partitions.
 type TopicManager struct {
-	mu     sync.RWMutex
-	topics map[string]*Topic
-	dataDir string
+	mu        sync.RWMutex
+	topics    map[string]*Topic
+	dataDir   string
 	logConfig log.CommitLogConfig
 }
 
 // NewTopicManager creates a new TopicManager.
 func NewTopicManager(dataDir string, logConfig log.CommitLogConfig) *TopicManager {
-	return &TopicManager{
+	tm := &TopicManager{
 		topics:    make(map[string]*Topic),
 		dataDir:   dataDir,
 		logConfig: logConfig,
+	}
+	tm.discoverExistingTopics()
+	return tm
+}
+
+// discoverExistingTopics scans dataDir for existing topic-partition
+// directories (named "topic-N") and re-opens their commit logs so data
+// survives broker restarts. Unknown directories are ignored.
+func (tm *TopicManager) discoverExistingTopics() {
+	entries, err := os.ReadDir(tm.dataDir)
+	if err != nil {
+		return
+	}
+	// Group directory names by topic: "topic-N" -> topic="topic", N=partition.
+	byTopic := make(map[string][]int32)
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		idx := strings.LastIndex(name, "-")
+		if idx <= 0 || idx == len(name)-1 {
+			continue
+		}
+		pStr := name[idx+1:]
+		pid, err := strconv.Atoi(pStr)
+		if err != nil || pid < 0 {
+			continue
+		}
+		topic := name[:idx]
+		byTopic[topic] = append(byTopic[topic], int32(pid))
+	}
+
+	for topic, parts := range byTopic {
+		maxID := int32(-1)
+		for _, p := range parts {
+			if p > maxID {
+				maxID = p
+			}
+		}
+		t := &Topic{
+			Name:       topic,
+			Partitions: make([]*Partition, maxID+1),
+		}
+		opened := 0
+		for _, pid := range parts {
+			dir := filepath.Join(tm.dataDir, fmt.Sprintf("%s-%d", topic, pid))
+			cl, err := log.NewCommitLog(dir, tm.logConfig)
+			if err != nil {
+				continue
+			}
+			t.Partitions[pid] = &Partition{ID: pid, Log: cl}
+			opened++
+		}
+		if opened > 0 {
+			tm.topics[topic] = t
+		}
 	}
 }
 

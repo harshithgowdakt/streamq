@@ -8,7 +8,7 @@ import (
 )
 
 const (
-	indexEntrySize = 12 // 4-byte relative offset + 8-byte position
+	indexEntrySize = 12               // 4-byte relative offset + 8-byte position
 	indexMaxSize   = 10 * 1024 * 1024 // 10 MB max index file
 )
 

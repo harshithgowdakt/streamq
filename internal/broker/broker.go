@@ -74,8 +74,13 @@ func NewBroker(cfg Config) *Broker {
 		retentionStop: make(chan struct{}),
 	}
 
-	// Initialize group coordinator
+	// Initialize group coordinator. In single-node mode start it immediately;
+	// in cluster mode ConnectToController starts it after joining the cluster
+	// so __consumer_offsets is created through the controller.
 	b.groupCoordinator = NewGroupCoordinator(b)
+	if cfg.ControllerAddr == "" {
+		b.groupCoordinator.Start()
+	}
 
 	// Start retention enforcement goroutine
 	checkMs := cfg.RetentionCheckMs
@@ -112,6 +117,10 @@ func (b *Broker) ConnectToController() error {
 	// Start ISR manager
 	b.isrManager = NewISRManager(b, 10000)
 	b.isrManager.Start()
+
+	// Now that we're registered, create __consumer_offsets through the
+	// controller (so it's replicated across the cluster) and replay it.
+	b.groupCoordinator.Start()
 
 	log.Printf("registered with controller as broker %d", id)
 	return nil
@@ -296,4 +305,3 @@ func parseAddr(addr string) (host, port string) {
 	}
 	return host, port
 }
-

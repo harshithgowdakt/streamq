@@ -2,14 +2,14 @@ package cluster
 
 // RPC message type IDs for the controller-broker protocol.
 const (
-	MsgRegisterBroker    byte = 1
+	MsgRegisterBroker     byte = 1
 	MsgRegisterBrokerResp byte = 2
-	MsgMetadataUpdate    byte = 3
-	MsgISRChange         byte = 4
-	MsgBrokerHeartbeat   byte = 5
-	MsgHeartbeatResp     byte = 6
-	MsgCreateTopicReq    byte = 7
-	MsgCreateTopicResp   byte = 8
+	MsgMetadataUpdate     byte = 3
+	MsgISRChange          byte = 4
+	MsgBrokerHeartbeat    byte = 5
+	MsgHeartbeatResp      byte = 6
+	MsgCreateTopicReq     byte = 7
+	MsgCreateTopicResp    byte = 8
 )
 
 // RegisterBrokerReq is sent by a broker to register itself with the controller.

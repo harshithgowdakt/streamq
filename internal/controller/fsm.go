@@ -7,8 +7,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/hashicorp/raft"
 	"github.com/harshithgowda/streamq/internal/cluster"
+	"github.com/hashicorp/raft"
 )
 
 // Command types for the Raft FSM.
@@ -41,8 +41,8 @@ type CreateTopicData struct {
 
 // UpdateISRData is the payload for CmdUpdateISR.
 type UpdateISRData struct {
-	Topic     string           `json:"topic"`
-	Partition int32            `json:"partition"`
+	Topic     string             `json:"topic"`
+	Partition int32              `json:"partition"`
 	NewISR    []cluster.BrokerID `json:"new_isr"`
 }
 
