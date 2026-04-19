@@ -37,10 +37,11 @@ func TestProducerSend(t *testing.T) {
 	addr := startTestServer(t)
 
 	cfg := Config{
-		BrokerAddr: addr,
-		BatchSize:  10,
-		LingerTime: 50 * time.Millisecond,
-		ClientID:   "test-producer",
+		BrokerAddr:     addr,
+		BatchSize:      10,
+		LingerTime:     50 * time.Millisecond,
+		RequestTimeout: 5 * time.Second,
+		ClientID:       "test-producer",
 	}
 
 	p, err := NewProducer(cfg)
@@ -79,10 +80,11 @@ func TestProducerBatching(t *testing.T) {
 	addr := startTestServer(t)
 
 	cfg := Config{
-		BrokerAddr: addr,
-		BatchSize:  5,
-		LingerTime: 500 * time.Millisecond,
-		ClientID:   "test-producer",
+		BrokerAddr:     addr,
+		BatchSize:      5,
+		LingerTime:     500 * time.Millisecond,
+		RequestTimeout: 5 * time.Second,
+		ClientID:       "test-producer",
 	}
 
 	p, err := NewProducer(cfg)

@@ -1,6 +1,7 @@
 package log
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -141,9 +142,20 @@ func (cl *CommitLog) rollSegment() error {
 }
 
 // Read reads batches starting from the given offset, returning up to maxBytes.
+// Returns ErrOffsetOutOfRange if offset is before the oldest available offset.
 func (cl *CommitLog) Read(offset int64, maxBytes int) ([]*RecordBatch, error) {
 	cl.mu.RLock()
 	defer cl.mu.RUnlock()
+
+	if len(cl.segments) == 0 {
+		return nil, nil
+	}
+
+	// Check if offset is before the oldest segment
+	oldest := cl.segments[0].GetBaseOffset()
+	if offset < oldest {
+		return nil, ErrOffsetOutOfRange
+	}
 
 	// Find the segment containing this offset
 	segIdx := cl.findSegment(offset)
@@ -157,7 +169,14 @@ func (cl *CommitLog) Read(offset int64, maxBytes int) ([]*RecordBatch, error) {
 	for i := segIdx; i < len(cl.segments) && bytesRemaining > 0; i++ {
 		batches, err := cl.segments[i].Read(offset, bytesRemaining)
 		if err != nil {
-			return nil, err
+			// Propagate corruption errors, skip offset-out-of-range for individual segments
+			if errors.Is(err, ErrCorruptRecord) {
+				return allBatches, err
+			}
+			if errors.Is(err, ErrOffsetOutOfRange) {
+				continue
+			}
+			return allBatches, err
 		}
 		for _, b := range batches {
 			allBatches = append(allBatches, b)
@@ -201,6 +220,11 @@ func (cl *CommitLog) NextOffset() int64 {
 	cl.mu.RLock()
 	defer cl.mu.RUnlock()
 	return cl.active.NextOffset()
+}
+
+// EarliestOffset returns the base offset of the oldest segment (alias for OldestOffset).
+func (cl *CommitLog) EarliestOffset() int64 {
+	return cl.OldestOffset()
 }
 
 // OldestOffset returns the base offset of the oldest segment.

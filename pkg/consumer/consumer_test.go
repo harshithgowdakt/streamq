@@ -5,8 +5,6 @@ import (
 	"time"
 
 	"github.com/harshithgowda/streamq/internal/broker"
-	"github.com/harshithgowda/streamq/internal/log"
-	"github.com/harshithgowda/streamq/internal/protocol"
 	"github.com/harshithgowda/streamq/internal/server"
 	"github.com/harshithgowda/streamq/pkg/producer"
 )
@@ -18,6 +16,7 @@ func startTestServer(t *testing.T) string {
 		DataDir:           t.TempDir(),
 		DefaultPartitions: 1,
 		MaxSegmentBytes:   1024 * 1024,
+		AutoCreateTopics:  true,
 		Addr:              ":0",
 	}
 	b := broker.NewBroker(cfg)
@@ -41,10 +40,11 @@ func TestConsumerPoll(t *testing.T) {
 
 	// Produce some messages first
 	p, err := producer.NewProducer(producer.Config{
-		BrokerAddr: addr,
-		BatchSize:  100,
-		LingerTime: 10 * time.Millisecond,
-		ClientID:   "test",
+		BrokerAddr:     addr,
+		BatchSize:      100,
+		LingerTime:     10 * time.Millisecond,
+		RequestTimeout: 5 * time.Second,
+		ClientID:       "test",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -102,6 +102,37 @@ func TestConsumerPoll(t *testing.T) {
 	}
 }
 
-// Ignore unused imports for this test file
-var _ = log.Record{}
-var _ = protocol.APIKeyProduce
+func TestConsumerOffsetOutOfRange(t *testing.T) {
+	addr := startTestServer(t)
+
+	// Produce a message
+	p, err := producer.NewProducer(producer.Config{
+		BrokerAddr:     addr,
+		BatchSize:      100,
+		LingerTime:     10 * time.Millisecond,
+		RequestTimeout: 5 * time.Second,
+		ClientID:       "test",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.Send(producer.Message{Topic: "test", Partition: 0, Value: []byte("msg")})
+	p.Close()
+
+	// Consume with invalid offset
+	c, err := NewConsumer(Config{
+		BrokerAddr: addr,
+		ClientID:   "test",
+		MaxBytes:   1024 * 1024,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	c.Subscribe("test", 0, -1) // before earliest
+	_, err = c.Poll()
+	if err == nil {
+		t.Fatal("expected offset out of range error")
+	}
+}

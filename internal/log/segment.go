@@ -1,11 +1,17 @@
 package log
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"sync"
+)
+
+var (
+	ErrOffsetOutOfRange = errors.New("offset out of range")
+	ErrCorruptRecord    = errors.New("corrupt record batch")
 )
 
 const (
@@ -178,12 +184,17 @@ func (s *Segment) Append(batch *RecordBatch) (int64, error) {
 
 // Read reads record batches starting from the given offset.
 // Returns up to maxBytes of data.
+// Returns ErrOffsetOutOfRange if offset is before baseOffset.
+// Returns ErrCorruptRecord if a CRC validation fails mid-read.
 func (s *Segment) Read(offset int64, maxBytes int) ([]*RecordBatch, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	if offset < s.baseOffset || offset >= s.nextOffset {
-		return nil, nil
+	if offset < s.baseOffset {
+		return nil, ErrOffsetOutOfRange
+	}
+	if offset >= s.nextOffset {
+		return nil, nil // no data yet at this offset
 	}
 
 	// Use index to find starting position
@@ -209,7 +220,10 @@ func (s *Segment) Read(offset int64, maxBytes int) ([]*RecordBatch, error) {
 	for bytesRead < maxBytes {
 		header := make([]byte, 12) // BaseOffset(8) + BatchLength(4)
 		if _, err := io.ReadFull(f, header); err != nil {
-			break
+			if err == io.EOF || err == io.ErrUnexpectedEOF {
+				break // normal end of file
+			}
+			return batches, err
 		}
 
 		batchLen := int64(int32(beUint32(header[8:])))
@@ -218,12 +232,15 @@ func (s *Segment) Read(offset int64, maxBytes int) ([]*RecordBatch, error) {
 		batchData := make([]byte, totalSize)
 		copy(batchData, header)
 		if _, err := io.ReadFull(f, batchData[12:]); err != nil {
-			break
+			if err == io.EOF || err == io.ErrUnexpectedEOF {
+				break // partial batch at end of file
+			}
+			return batches, err
 		}
 
 		batch, err := DecodeRecordBatch(batchData)
 		if err != nil {
-			break
+			return batches, fmt.Errorf("%w: %v", ErrCorruptRecord, err)
 		}
 
 		// Skip batches before our target offset

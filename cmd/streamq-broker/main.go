@@ -16,12 +16,14 @@ func main() {
 	dataDir := flag.String("data-dir", "/tmp/streamq-data", "data directory")
 	defaultPartitions := flag.Int("default-partitions", 1, "default number of partitions for auto-created topics")
 	maxSegmentBytes := flag.Int64("max-segment-bytes", 1024*1024*1024, "max segment size in bytes")
+	autoCreate := flag.Bool("auto-create-topics", true, "auto-create topics on produce")
 	flag.Parse()
 
 	cfg := broker.Config{
 		DataDir:           *dataDir,
 		DefaultPartitions: int32(*defaultPartitions),
 		MaxSegmentBytes:   *maxSegmentBytes,
+		AutoCreateTopics:  *autoCreate,
 		Addr:              *addr,
 	}
 

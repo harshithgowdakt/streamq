@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/harshithgowda/streamq/internal/broker"
-	"github.com/harshithgowda/streamq/internal/log"
 	"github.com/harshithgowda/streamq/internal/protocol"
 	"github.com/harshithgowda/streamq/internal/server"
 	"github.com/harshithgowda/streamq/pkg/consumer"
@@ -40,7 +39,6 @@ func sendRawRequest(conn net.Conn, req interface{}) ([]byte, error) {
 }
 
 func TestEndToEnd(t *testing.T) {
-	// Start broker
 	cfg := broker.Config{
 		DataDir:           t.TempDir(),
 		DefaultPartitions: 1,
@@ -79,7 +77,7 @@ func TestEndToEnd(t *testing.T) {
 	}
 	conn.Close()
 
-	createResp, err := protocol.DecodeResponse(protocol.APIKeyCreateTopics, respBytes)
+	createResp, err := protocol.DecodeResponse(protocol.APIKeyCreateTopics, 0, respBytes)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -90,10 +88,11 @@ func TestEndToEnd(t *testing.T) {
 
 	// Step 2: Produce messages using producer client
 	p, err := producer.NewProducer(producer.Config{
-		BrokerAddr: addr,
-		BatchSize:  100,
-		LingerTime: 10 * time.Millisecond,
-		ClientID:   "e2e-producer",
+		BrokerAddr:     addr,
+		BatchSize:      100,
+		LingerTime:     10 * time.Millisecond,
+		RequestTimeout: 5 * time.Second,
+		ClientID:       "e2e-producer",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -171,7 +170,7 @@ func TestEndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	metaResp, err := protocol.DecodeResponse(protocol.APIKeyMetadata, metaBytes)
+	metaResp, err := protocol.DecodeResponse(protocol.APIKeyMetadata, 0, metaBytes)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -211,10 +210,11 @@ func TestEndToEndMultiPartition(t *testing.T) {
 
 	// Produce to all 3 partitions
 	p, err := producer.NewProducer(producer.Config{
-		BrokerAddr: addr,
-		BatchSize:  100,
-		LingerTime: 10 * time.Millisecond,
-		ClientID:   "test",
+		BrokerAddr:     addr,
+		BatchSize:      100,
+		LingerTime:     10 * time.Millisecond,
+		RequestTimeout: 5 * time.Second,
+		ClientID:       "test",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -258,5 +258,69 @@ func TestEndToEndMultiPartition(t *testing.T) {
 	}
 }
 
-// Ensure log import is used
-var _ = log.Record{}
+func TestEndToEndAutoCreateTopic(t *testing.T) {
+	cfg := broker.Config{
+		DataDir:           t.TempDir(),
+		DefaultPartitions: 2,
+		MaxSegmentBytes:   1024 * 1024,
+		AutoCreateTopics:  true,
+		Addr:              ":0",
+	}
+	b := broker.NewBroker(cfg)
+	srv := server.NewServer(b)
+	if err := srv.Start(":0"); err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Stop()
+	defer b.Close()
+
+	addr := srv.Addr().String()
+
+	// Produce to a topic that doesn't exist yet — should auto-create
+	p, err := producer.NewProducer(producer.Config{
+		BrokerAddr:     addr,
+		BatchSize:      100,
+		LingerTime:     10 * time.Millisecond,
+		RequestTimeout: 5 * time.Second,
+		ClientID:       "test",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	offset, err := p.Send(producer.Message{
+		Topic:     "auto-topic",
+		Partition: 0,
+		Value:     []byte("auto-created-message"),
+	})
+	if err != nil {
+		t.Fatalf("send to auto-created topic: %v", err)
+	}
+	if offset != 0 {
+		t.Errorf("expected offset 0, got %d", offset)
+	}
+	p.Close()
+
+	// Consume it back
+	c, err := consumer.NewConsumer(consumer.Config{
+		BrokerAddr: addr,
+		ClientID:   "test",
+		MaxBytes:   1024 * 1024,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	c.Subscribe("auto-topic", 0, 0)
+	messages, err := c.Poll()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(messages) != 1 {
+		t.Fatalf("expected 1 message, got %d", len(messages))
+	}
+	if string(messages[0].Value) != "auto-created-message" {
+		t.Errorf("value: %q", messages[0].Value)
+	}
+}

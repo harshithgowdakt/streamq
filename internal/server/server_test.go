@@ -75,7 +75,7 @@ func TestServerProduceAndFetch(t *testing.T) {
 	}
 	defer conn.Close()
 
-	// Produce
+	// Produce using Kafka RecordBatch format
 	batch := &log.RecordBatch{
 		Records: []log.Record{
 			{Key: []byte("key"), Value: []byte("hello from server test")},
@@ -85,14 +85,16 @@ func TestServerProduceAndFetch(t *testing.T) {
 	respBytes, err := sendRequest(conn, &protocol.ProduceRequest{
 		Header: protocol.RequestHeader{
 			APIKey:        protocol.APIKeyProduce,
+			APIVersion:    3,
 			CorrelationID: 1,
 			ClientID:      "test",
 		},
+		Acks: -1,
 		Topics: []protocol.ProduceTopicData{
 			{
 				Topic: "test",
 				Partitions: []protocol.ProducePartitionData{
-					{Partition: 0, Records: batch.Encode()},
+					{Partition: 0, Records: protocol.InternalToKafkaRecordBatch(batch)},
 				},
 			},
 		},
@@ -101,7 +103,7 @@ func TestServerProduceAndFetch(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	produceResp, err := protocol.DecodeResponse(protocol.APIKeyProduce, respBytes)
+	produceResp, err := protocol.DecodeResponse(protocol.APIKeyProduce, 3, respBytes)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -114,10 +116,12 @@ func TestServerProduceAndFetch(t *testing.T) {
 	respBytes, err = sendRequest(conn, &protocol.FetchRequest{
 		Header: protocol.RequestHeader{
 			APIKey:        protocol.APIKeyFetch,
+			APIVersion:    4,
 			CorrelationID: 2,
 			ClientID:      "test",
 		},
-		MaxBytes: 1024 * 1024,
+		ReplicaID: -1,
+		MaxBytes:  1024 * 1024,
 		Topics: []protocol.FetchTopicData{
 			{
 				Topic: "test",
@@ -131,7 +135,7 @@ func TestServerProduceAndFetch(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	fetchResp, err := protocol.DecodeResponse(protocol.APIKeyFetch, respBytes)
+	fetchResp, err := protocol.DecodeResponse(protocol.APIKeyFetch, 4, respBytes)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -141,11 +145,49 @@ func TestServerProduceAndFetch(t *testing.T) {
 	}
 
 	rawBatches := fr.Topics[0].Partitions[0].RecordBatches
-	decoded, err := log.DecodeRecordBatch(rawBatches)
+	batches, err := protocol.KafkaRecordBatchToInternal(rawBatches)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(decoded.Records[0].Value) != "hello from server test" {
-		t.Errorf("got value %q", decoded.Records[0].Value)
+	if len(batches) == 0 || len(batches[0].Records) == 0 {
+		t.Fatal("no records in response")
+	}
+	if string(batches[0].Records[0].Value) != "hello from server test" {
+		t.Errorf("got value %q", batches[0].Records[0].Value)
+	}
+}
+
+func TestServerApiVersions(t *testing.T) {
+	_, addr := testServer(t)
+
+	conn, err := net.Dial("tcp", addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	respBytes, err := sendRequest(conn, &protocol.ApiVersionsRequest{
+		Header: protocol.RequestHeader{
+			APIKey:        protocol.APIKeyApiVersions,
+			APIVersion:    0,
+			CorrelationID: 1,
+			ClientID:      "test",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	resp, err := protocol.DecodeResponse(protocol.APIKeyApiVersions, 0, respBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	avResp := resp.(*protocol.ApiVersionsResponse)
+	if avResp.ErrorCode != protocol.ErrNone {
+		t.Fatalf("error code: %d", avResp.ErrorCode)
+	}
+	if len(avResp.ApiVersions) == 0 {
+		t.Fatal("expected api versions in response")
 	}
 }

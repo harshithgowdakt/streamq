@@ -102,6 +102,18 @@ func (tm *TopicManager) ListTopics() []string {
 	return names
 }
 
+// EnforceRetention runs retention enforcement on all partition logs.
+func (tm *TopicManager) EnforceRetention() {
+	tm.mu.RLock()
+	defer tm.mu.RUnlock()
+
+	for _, topic := range tm.topics {
+		for _, p := range topic.Partitions {
+			p.Log.EnforceRetention()
+		}
+	}
+}
+
 // Close closes all partition logs.
 func (tm *TopicManager) Close() error {
 	tm.mu.Lock()

@@ -7,24 +7,33 @@ import (
 
 // API keys
 const (
-	APIKeyProduce      int16 = 0
-	APIKeyFetch        int16 = 1
-	APIKeyMetadata     int16 = 3
-	APIKeyCreateTopics int16 = 19
+	APIKeyProduce         int16 = 0
+	APIKeyFetch           int16 = 1
+	APIKeyListOffsets     int16 = 2
+	APIKeyMetadata        int16 = 3
+	APIKeyOffsetFetch     int16 = 9
+	APIKeyFindCoordinator int16 = 10
+	APIKeyJoinGroup       int16 = 11
+	APIKeyApiVersions     int16 = 18
+	APIKeyCreateTopics    int16 = 19
 )
 
 // Error codes
 const (
-	ErrNone                 int16 = 0
-	ErrUnknown              int16 = -1
-	ErrUnknownTopicOrPart   int16 = 3
-	ErrInvalidMessage       int16 = 4
-	ErrTopicAlreadyExists   int16 = 36
-	ErrInvalidPartitions    int16 = 37
+	ErrNone               int16 = 0
+	ErrUnknown            int16 = -1
+	ErrOffsetOutOfRange   int16 = 1
+	ErrCorruptMessage     int16 = 2
+	ErrUnknownTopicOrPart int16 = 3
+	ErrInvalidMessage     int16 = 4
+	ErrGroupCoordinatorNotAvailable int16 = 15
+	ErrNotCoordinator     int16 = 16
+	ErrUnsupportedVersion int16 = 35
+	ErrTopicAlreadyExists int16 = 36
+	ErrInvalidPartitions  int16 = 37
 )
 
 // RequestHeader is the common header for all requests.
-// Wire format: APIKey(int16) + APIVersion(int16) + CorrelationID(int32) + ClientID(string)
 type RequestHeader struct {
 	APIKey        int16
 	APIVersion    int16
@@ -40,9 +49,11 @@ type ResponseHeader struct {
 // --- Produce ---
 
 type ProduceRequest struct {
-	Header    RequestHeader
-	TimeoutMs int32
-	Topics    []ProduceTopicData
+	Header          RequestHeader
+	TransactionalID *string // v3+
+	Acks            int16
+	TimeoutMs       int32
+	Topics          []ProduceTopicData
 }
 
 type ProduceTopicData struct {
@@ -56,8 +67,9 @@ type ProducePartitionData struct {
 }
 
 type ProduceResponse struct {
-	Header ResponseHeader
-	Topics []ProduceTopicResponse
+	Header  ResponseHeader
+	Version int16
+	Topics  []ProduceTopicResponse
 }
 
 type ProduceTopicResponse struct {
@@ -66,19 +78,22 @@ type ProduceTopicResponse struct {
 }
 
 type ProducePartitionResponse struct {
-	Partition  int32
-	ErrorCode  int16
-	BaseOffset int64
+	Partition      int32
+	ErrorCode      int16
+	BaseOffset     int64
+	LogAppendTimeMs int64 // v2+
 }
 
 // --- Fetch ---
 
 type FetchRequest struct {
-	Header  RequestHeader
-	MaxWaitMs int32
-	MinBytes  int32
-	MaxBytes  int32
-	Topics    []FetchTopicData
+	Header         RequestHeader
+	ReplicaID      int32 // v4
+	MaxWaitMs      int32
+	MinBytes       int32
+	MaxBytes       int32
+	IsolationLevel int8 // v4
+	Topics         []FetchTopicData
 }
 
 type FetchTopicData struct {
@@ -93,8 +108,9 @@ type FetchPartitionData struct {
 }
 
 type FetchResponse struct {
-	Header ResponseHeader
-	Topics []FetchTopicResponse
+	Header  ResponseHeader
+	Version int16
+	Topics  []FetchTopicResponse
 }
 
 type FetchTopicResponse struct {
@@ -103,8 +119,8 @@ type FetchTopicResponse struct {
 }
 
 type FetchPartitionResponse struct {
-	Partition  int32
-	ErrorCode  int16
+	Partition     int32
+	ErrorCode     int16
 	HighWatermark int64
 	RecordBatches []byte // raw bytes of concatenated RecordBatches
 }
@@ -117,7 +133,8 @@ type MetadataRequest struct {
 }
 
 type MetadataResponse struct {
-	Header ResponseHeader
+	Header  ResponseHeader
+	Version int16
 	Brokers []BrokerInfo
 	Topics  []TopicMetadata
 }
@@ -138,19 +155,23 @@ type PartitionMetadata struct {
 	ErrorCode int16
 	Partition int32
 	Leader    int32
+	Replicas  []int32
+	ISR       []int32
 }
 
 // --- CreateTopics ---
 
 type CreateTopicsRequest struct {
-	Header    RequestHeader
-	Topics    []CreateTopicRequest
-	TimeoutMs int32
+	Header       RequestHeader
+	Topics       []CreateTopicRequest
+	TimeoutMs    int32
+	ValidateOnly bool
 }
 
 type CreateTopicRequest struct {
-	Topic         string
-	NumPartitions int32
+	Topic             string
+	NumPartitions     int32
+	ReplicationFactor int16
 }
 
 type CreateTopicsResponse struct {
@@ -163,6 +184,118 @@ type CreateTopicResult struct {
 	ErrorCode int16
 }
 
+// --- ApiVersions ---
+
+type ApiVersionsRequest struct {
+	Header RequestHeader
+}
+
+type ApiVersionsResponse struct {
+	Header       ResponseHeader
+	Version      int16
+	ErrorCode    int16
+	ApiVersions  []ApiVersionRange
+}
+
+type ApiVersionRange struct {
+	APIKey     int16
+	MinVersion int16
+	MaxVersion int16
+}
+
+// --- ListOffsets ---
+
+type ListOffsetsRequest struct {
+	Header    RequestHeader
+	ReplicaID int32
+	Topics    []ListOffsetsTopic
+}
+
+type ListOffsetsTopic struct {
+	Topic      string
+	Partitions []ListOffsetsPartition
+}
+
+type ListOffsetsPartition struct {
+	Partition int32
+	Timestamp int64 // -1=latest, -2=earliest
+}
+
+type ListOffsetsResponse struct {
+	Header ResponseHeader
+	Topics []ListOffsetsTopicResponse
+}
+
+type ListOffsetsTopicResponse struct {
+	Topic      string
+	Partitions []ListOffsetsPartitionResponse
+}
+
+type ListOffsetsPartitionResponse struct {
+	Partition int32
+	ErrorCode int16
+	Timestamp int64
+	Offset    int64
+}
+
+// --- FindCoordinator ---
+
+type FindCoordinatorRequest struct {
+	Header RequestHeader
+	Key    string // group id
+	KeyType int8  // 0=group, 1=transactional
+}
+
+type FindCoordinatorResponse struct {
+	Header      ResponseHeader
+	ErrorCode   int16
+	NodeID      int32
+	Host        string
+	Port        int32
+}
+
+// --- JoinGroup ---
+
+type JoinGroupRequest struct {
+	Header RequestHeader
+	// We only need to read enough to return an error
+}
+
+type JoinGroupResponse struct {
+	Header       ResponseHeader
+	ErrorCode    int16
+}
+
+// --- OffsetFetch ---
+
+type OffsetFetchRequest struct {
+	Header  RequestHeader
+	GroupID string
+	Topics  []OffsetFetchTopic
+}
+
+type OffsetFetchTopic struct {
+	Topic      string
+	Partitions []int32
+}
+
+type OffsetFetchResponse struct {
+	Header ResponseHeader
+	Topics []OffsetFetchTopicResponse
+}
+
+type OffsetFetchTopicResponse struct {
+	Topic      string
+	Partitions []OffsetFetchPartitionResponse
+}
+
+type OffsetFetchPartitionResponse struct {
+	Partition       int32
+	CommittedOffset int64
+	Metadata        *string
+	ErrorCode       int16
+}
+
 // EncodeRequest encodes a request to bytes (header + body, no frame length prefix).
 func EncodeRequest(req interface{}) ([]byte, error) {
 	var buf bytes.Buffer
@@ -171,6 +304,10 @@ func EncodeRequest(req interface{}) ([]byte, error) {
 	switch r := req.(type) {
 	case *ProduceRequest:
 		encodeRequestHeader(enc, &r.Header)
+		if r.Header.APIVersion >= 3 {
+			enc.WriteNullableString(r.TransactionalID)
+		}
+		enc.WriteInt16(r.Acks)
 		enc.WriteInt32(r.TimeoutMs)
 		enc.WriteInt32(int32(len(r.Topics)))
 		for _, t := range r.Topics {
@@ -184,9 +321,15 @@ func EncodeRequest(req interface{}) ([]byte, error) {
 
 	case *FetchRequest:
 		encodeRequestHeader(enc, &r.Header)
+		enc.WriteInt32(r.ReplicaID)
 		enc.WriteInt32(r.MaxWaitMs)
 		enc.WriteInt32(r.MinBytes)
-		enc.WriteInt32(r.MaxBytes)
+		if r.Header.APIVersion >= 3 {
+			enc.WriteInt32(r.MaxBytes)
+		}
+		if r.Header.APIVersion >= 4 {
+			enc.WriteInt8(r.IsolationLevel)
+		}
 		enc.WriteInt32(int32(len(r.Topics)))
 		for _, t := range r.Topics {
 			enc.WriteString(t.Topic)
@@ -211,8 +354,43 @@ func EncodeRequest(req interface{}) ([]byte, error) {
 		for _, t := range r.Topics {
 			enc.WriteString(t.Topic)
 			enc.WriteInt32(t.NumPartitions)
+			enc.WriteInt16(t.ReplicationFactor)
+			enc.WriteInt32(0) // num assignments
+			enc.WriteInt32(0) // num configs
 		}
 		enc.WriteInt32(r.TimeoutMs)
+
+	case *ApiVersionsRequest:
+		encodeRequestHeader(enc, &r.Header)
+
+	case *ListOffsetsRequest:
+		encodeRequestHeader(enc, &r.Header)
+		enc.WriteInt32(r.ReplicaID)
+		enc.WriteInt32(int32(len(r.Topics)))
+		for _, t := range r.Topics {
+			enc.WriteString(t.Topic)
+			enc.WriteInt32(int32(len(t.Partitions)))
+			for _, p := range t.Partitions {
+				enc.WriteInt32(p.Partition)
+				enc.WriteInt64(p.Timestamp)
+			}
+		}
+
+	case *FindCoordinatorRequest:
+		encodeRequestHeader(enc, &r.Header)
+		enc.WriteString(r.Key)
+
+	case *OffsetFetchRequest:
+		encodeRequestHeader(enc, &r.Header)
+		enc.WriteString(r.GroupID)
+		enc.WriteInt32(int32(len(r.Topics)))
+		for _, t := range r.Topics {
+			enc.WriteString(t.Topic)
+			enc.WriteInt32(int32(len(t.Partitions)))
+			for _, p := range t.Partitions {
+				enc.WriteInt32(p)
+			}
+		}
 
 	default:
 		return nil, fmt.Errorf("unknown request type: %T", req)
@@ -234,6 +412,12 @@ func DecodeRequest(data []byte) (interface{}, error) {
 		CorrelationID: dec.ReadInt32(),
 		ClientID:      dec.ReadString(),
 	}
+
+	// For ApiVersions v2+ (flexible versions), skip tagged fields in the header
+	if header.APIKey == APIKeyApiVersions && header.APIVersion >= 2 {
+		dec.ReadTaggedFields()
+	}
+
 	if dec.Err() != nil {
 		return nil, fmt.Errorf("decode header: %w", dec.Err())
 	}
@@ -241,6 +425,10 @@ func DecodeRequest(data []byte) (interface{}, error) {
 	switch header.APIKey {
 	case APIKeyProduce:
 		req := &ProduceRequest{Header: header}
+		if header.APIVersion >= 3 {
+			req.TransactionalID = dec.ReadNullableString()
+		}
+		req.Acks = dec.ReadInt16()
 		req.TimeoutMs = dec.ReadInt32()
 		topicCount := dec.ReadInt32()
 		req.Topics = make([]ProduceTopicData, topicCount)
@@ -260,9 +448,15 @@ func DecodeRequest(data []byte) (interface{}, error) {
 
 	case APIKeyFetch:
 		req := &FetchRequest{Header: header}
+		req.ReplicaID = dec.ReadInt32()
 		req.MaxWaitMs = dec.ReadInt32()
 		req.MinBytes = dec.ReadInt32()
-		req.MaxBytes = dec.ReadInt32()
+		if header.APIVersion >= 3 {
+			req.MaxBytes = dec.ReadInt32()
+		}
+		if header.APIVersion >= 4 {
+			req.IsolationLevel = dec.ReadInt8()
+		}
 		topicCount := dec.ReadInt32()
 		req.Topics = make([]FetchTopicData, topicCount)
 		for i := range req.Topics {
@@ -283,9 +477,11 @@ func DecodeRequest(data []byte) (interface{}, error) {
 	case APIKeyMetadata:
 		req := &MetadataRequest{Header: header}
 		topicCount := dec.ReadInt32()
-		req.Topics = make([]string, topicCount)
-		for i := range req.Topics {
-			req.Topics[i] = dec.ReadString()
+		if topicCount >= 0 {
+			req.Topics = make([]string, topicCount)
+			for i := range req.Topics {
+				req.Topics[i] = dec.ReadString()
+			}
 		}
 		if dec.Err() != nil {
 			return nil, dec.Err()
@@ -299,8 +495,85 @@ func DecodeRequest(data []byte) (interface{}, error) {
 		for i := range req.Topics {
 			req.Topics[i].Topic = dec.ReadString()
 			req.Topics[i].NumPartitions = dec.ReadInt32()
+			req.Topics[i].ReplicationFactor = dec.ReadInt16()
+			// Read and skip assignments
+			numAssignments := dec.ReadInt32()
+			for a := int32(0); a < numAssignments && dec.Err() == nil; a++ {
+				_ = dec.ReadInt32() // partition
+				numReplicas := dec.ReadInt32()
+				for r := int32(0); r < numReplicas && dec.Err() == nil; r++ {
+					_ = dec.ReadInt32() // broker
+				}
+			}
+			// Read and skip configs
+			numConfigs := dec.ReadInt32()
+			for c := int32(0); c < numConfigs && dec.Err() == nil; c++ {
+				_ = dec.ReadString() // key
+				_ = dec.ReadNullableString() // value
+			}
 		}
 		req.TimeoutMs = dec.ReadInt32()
+		if dec.Err() != nil {
+			return nil, dec.Err()
+		}
+		return req, nil
+
+	case APIKeyApiVersions:
+		req := &ApiVersionsRequest{Header: header}
+		// v0-v2: empty body (v2 tagged fields already read above)
+		return req, nil
+
+	case APIKeyListOffsets:
+		req := &ListOffsetsRequest{Header: header}
+		req.ReplicaID = dec.ReadInt32()
+		topicCount := dec.ReadInt32()
+		req.Topics = make([]ListOffsetsTopic, topicCount)
+		for i := range req.Topics {
+			req.Topics[i].Topic = dec.ReadString()
+			partCount := dec.ReadInt32()
+			req.Topics[i].Partitions = make([]ListOffsetsPartition, partCount)
+			for j := range req.Topics[i].Partitions {
+				req.Topics[i].Partitions[j].Partition = dec.ReadInt32()
+				req.Topics[i].Partitions[j].Timestamp = dec.ReadInt64()
+				if header.APIVersion == 0 {
+					_ = dec.ReadInt32() // maxNumOffsets (v0 only)
+				}
+			}
+		}
+		if dec.Err() != nil {
+			return nil, dec.Err()
+		}
+		return req, nil
+
+	case APIKeyFindCoordinator:
+		req := &FindCoordinatorRequest{Header: header}
+		req.Key = dec.ReadString()
+		if header.APIVersion >= 1 {
+			req.KeyType = dec.ReadInt8()
+		}
+		if dec.Err() != nil {
+			return nil, dec.Err()
+		}
+		return req, nil
+
+	case APIKeyJoinGroup:
+		req := &JoinGroupRequest{Header: header}
+		// We just need the header to return an error
+		return req, nil
+
+	case APIKeyOffsetFetch:
+		req := &OffsetFetchRequest{Header: header}
+		req.GroupID = dec.ReadString()
+		topicCount := dec.ReadInt32()
+		req.Topics = make([]OffsetFetchTopic, topicCount)
+		for i := range req.Topics {
+			req.Topics[i].Topic = dec.ReadString()
+			partCount := dec.ReadInt32()
+			req.Topics[i].Partitions = make([]int32, partCount)
+			for j := range req.Topics[i].Partitions {
+				req.Topics[i].Partitions[j] = dec.ReadInt32()
+			}
+		}
 		if dec.Err() != nil {
 			return nil, dec.Err()
 		}
@@ -327,11 +600,20 @@ func EncodeResponse(resp interface{}) ([]byte, error) {
 				enc.WriteInt32(p.Partition)
 				enc.WriteInt16(p.ErrorCode)
 				enc.WriteInt64(p.BaseOffset)
+				if r.Version >= 2 {
+					enc.WriteInt64(p.LogAppendTimeMs)
+				}
 			}
+		}
+		if r.Version >= 1 {
+			enc.WriteInt32(0) // throttleTimeMs
 		}
 
 	case *FetchResponse:
 		enc.WriteInt32(r.Header.CorrelationID)
+		if r.Version >= 1 {
+			enc.WriteInt32(0) // throttleTimeMs
+		}
 		enc.WriteInt32(int32(len(r.Topics)))
 		for _, t := range r.Topics {
 			enc.WriteString(t.Topic)
@@ -361,6 +643,16 @@ func EncodeResponse(resp interface{}) ([]byte, error) {
 				enc.WriteInt16(p.ErrorCode)
 				enc.WriteInt32(p.Partition)
 				enc.WriteInt32(p.Leader)
+				// Replicas
+				enc.WriteInt32(int32(len(p.Replicas)))
+				for _, rep := range p.Replicas {
+					enc.WriteInt32(rep)
+				}
+				// ISR
+				enc.WriteInt32(int32(len(p.ISR)))
+				for _, isr := range p.ISR {
+					enc.WriteInt32(isr)
+				}
 			}
 		}
 
@@ -370,6 +662,63 @@ func EncodeResponse(resp interface{}) ([]byte, error) {
 		for _, t := range r.Topics {
 			enc.WriteString(t.Topic)
 			enc.WriteInt16(t.ErrorCode)
+		}
+
+	case *ApiVersionsResponse:
+		enc.WriteInt32(r.Header.CorrelationID)
+		enc.WriteInt16(r.ErrorCode)
+		enc.WriteInt32(int32(len(r.ApiVersions)))
+		for _, av := range r.ApiVersions {
+			enc.WriteInt16(av.APIKey)
+			enc.WriteInt16(av.MinVersion)
+			enc.WriteInt16(av.MaxVersion)
+		}
+		if r.Version >= 1 {
+			enc.WriteInt32(0) // throttleTimeMs
+		}
+
+	case *ListOffsetsResponse:
+		enc.WriteInt32(r.Header.CorrelationID)
+		enc.WriteInt32(int32(len(r.Topics)))
+		for _, t := range r.Topics {
+			enc.WriteString(t.Topic)
+			enc.WriteInt32(int32(len(t.Partitions)))
+			for _, p := range t.Partitions {
+				enc.WriteInt32(p.Partition)
+				enc.WriteInt16(p.ErrorCode)
+				enc.WriteInt64(p.Timestamp)
+				enc.WriteInt64(p.Offset)
+			}
+		}
+
+	case *FindCoordinatorResponse:
+		enc.WriteInt32(r.Header.CorrelationID)
+		enc.WriteInt16(r.ErrorCode)
+		enc.WriteInt32(r.NodeID)
+		enc.WriteString(r.Host)
+		enc.WriteInt32(r.Port)
+
+	case *JoinGroupResponse:
+		enc.WriteInt32(r.Header.CorrelationID)
+		enc.WriteInt16(r.ErrorCode)
+		enc.WriteInt32(-1)         // generationId
+		enc.WriteString("")        // protocolName
+		enc.WriteString("")        // leader
+		enc.WriteString("")        // memberId
+		enc.WriteInt32(0)          // members count
+
+	case *OffsetFetchResponse:
+		enc.WriteInt32(r.Header.CorrelationID)
+		enc.WriteInt32(int32(len(r.Topics)))
+		for _, t := range r.Topics {
+			enc.WriteString(t.Topic)
+			enc.WriteInt32(int32(len(t.Partitions)))
+			for _, p := range t.Partitions {
+				enc.WriteInt32(p.Partition)
+				enc.WriteInt64(p.CommittedOffset)
+				enc.WriteNullableString(p.Metadata)
+				enc.WriteInt16(p.ErrorCode)
+			}
 		}
 
 	default:
@@ -382,15 +731,15 @@ func EncodeResponse(resp interface{}) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-// DecodeResponse decodes a response from bytes given the API key.
-func DecodeResponse(apiKey int16, data []byte) (interface{}, error) {
+// DecodeResponse decodes a response from bytes given the API key and version.
+func DecodeResponse(apiKey int16, apiVersion int16, data []byte) (interface{}, error) {
 	dec := NewDecoder(bytes.NewReader(data))
 
 	correlationID := dec.ReadInt32()
 
 	switch apiKey {
 	case APIKeyProduce:
-		resp := &ProduceResponse{Header: ResponseHeader{CorrelationID: correlationID}}
+		resp := &ProduceResponse{Header: ResponseHeader{CorrelationID: correlationID}, Version: apiVersion}
 		topicCount := dec.ReadInt32()
 		resp.Topics = make([]ProduceTopicResponse, topicCount)
 		for i := range resp.Topics {
@@ -401,7 +750,13 @@ func DecodeResponse(apiKey int16, data []byte) (interface{}, error) {
 				resp.Topics[i].Partitions[j].Partition = dec.ReadInt32()
 				resp.Topics[i].Partitions[j].ErrorCode = dec.ReadInt16()
 				resp.Topics[i].Partitions[j].BaseOffset = dec.ReadInt64()
+				if apiVersion >= 2 {
+					resp.Topics[i].Partitions[j].LogAppendTimeMs = dec.ReadInt64()
+				}
 			}
+		}
+		if apiVersion >= 1 {
+			_ = dec.ReadInt32() // throttleTimeMs
 		}
 		if dec.Err() != nil {
 			return nil, dec.Err()
@@ -409,7 +764,10 @@ func DecodeResponse(apiKey int16, data []byte) (interface{}, error) {
 		return resp, nil
 
 	case APIKeyFetch:
-		resp := &FetchResponse{Header: ResponseHeader{CorrelationID: correlationID}}
+		resp := &FetchResponse{Header: ResponseHeader{CorrelationID: correlationID}, Version: apiVersion}
+		if apiVersion >= 1 {
+			_ = dec.ReadInt32() // throttleTimeMs
+		}
 		topicCount := dec.ReadInt32()
 		resp.Topics = make([]FetchTopicResponse, topicCount)
 		for i := range resp.Topics {
@@ -429,7 +787,7 @@ func DecodeResponse(apiKey int16, data []byte) (interface{}, error) {
 		return resp, nil
 
 	case APIKeyMetadata:
-		resp := &MetadataResponse{Header: ResponseHeader{CorrelationID: correlationID}}
+		resp := &MetadataResponse{Header: ResponseHeader{CorrelationID: correlationID}, Version: apiVersion}
 		brokerCount := dec.ReadInt32()
 		resp.Brokers = make([]BrokerInfo, brokerCount)
 		for i := range resp.Brokers {
@@ -448,6 +806,18 @@ func DecodeResponse(apiKey int16, data []byte) (interface{}, error) {
 				resp.Topics[i].Partitions[j].ErrorCode = dec.ReadInt16()
 				resp.Topics[i].Partitions[j].Partition = dec.ReadInt32()
 				resp.Topics[i].Partitions[j].Leader = dec.ReadInt32()
+				// Replicas
+				repCount := dec.ReadInt32()
+				resp.Topics[i].Partitions[j].Replicas = make([]int32, repCount)
+				for k := int32(0); k < repCount; k++ {
+					resp.Topics[i].Partitions[j].Replicas[k] = dec.ReadInt32()
+				}
+				// ISR
+				isrCount := dec.ReadInt32()
+				resp.Topics[i].Partitions[j].ISR = make([]int32, isrCount)
+				for k := int32(0); k < isrCount; k++ {
+					resp.Topics[i].Partitions[j].ISR[k] = dec.ReadInt32()
+				}
 			}
 		}
 		if dec.Err() != nil {
@@ -463,6 +833,55 @@ func DecodeResponse(apiKey int16, data []byte) (interface{}, error) {
 			resp.Topics[i].Topic = dec.ReadString()
 			resp.Topics[i].ErrorCode = dec.ReadInt16()
 		}
+		if dec.Err() != nil {
+			return nil, dec.Err()
+		}
+		return resp, nil
+
+	case APIKeyApiVersions:
+		resp := &ApiVersionsResponse{Header: ResponseHeader{CorrelationID: correlationID}, Version: apiVersion}
+		resp.ErrorCode = dec.ReadInt16()
+		apiCount := dec.ReadInt32()
+		resp.ApiVersions = make([]ApiVersionRange, apiCount)
+		for i := range resp.ApiVersions {
+			resp.ApiVersions[i].APIKey = dec.ReadInt16()
+			resp.ApiVersions[i].MinVersion = dec.ReadInt16()
+			resp.ApiVersions[i].MaxVersion = dec.ReadInt16()
+		}
+		if apiVersion >= 1 {
+			_ = dec.ReadInt32() // throttleTimeMs
+		}
+		if dec.Err() != nil {
+			return nil, dec.Err()
+		}
+		return resp, nil
+
+	case APIKeyListOffsets:
+		resp := &ListOffsetsResponse{Header: ResponseHeader{CorrelationID: correlationID}}
+		topicCount := dec.ReadInt32()
+		resp.Topics = make([]ListOffsetsTopicResponse, topicCount)
+		for i := range resp.Topics {
+			resp.Topics[i].Topic = dec.ReadString()
+			partCount := dec.ReadInt32()
+			resp.Topics[i].Partitions = make([]ListOffsetsPartitionResponse, partCount)
+			for j := range resp.Topics[i].Partitions {
+				resp.Topics[i].Partitions[j].Partition = dec.ReadInt32()
+				resp.Topics[i].Partitions[j].ErrorCode = dec.ReadInt16()
+				resp.Topics[i].Partitions[j].Timestamp = dec.ReadInt64()
+				resp.Topics[i].Partitions[j].Offset = dec.ReadInt64()
+			}
+		}
+		if dec.Err() != nil {
+			return nil, dec.Err()
+		}
+		return resp, nil
+
+	case APIKeyFindCoordinator:
+		resp := &FindCoordinatorResponse{Header: ResponseHeader{CorrelationID: correlationID}}
+		resp.ErrorCode = dec.ReadInt16()
+		resp.NodeID = dec.ReadInt32()
+		resp.Host = dec.ReadString()
+		resp.Port = dec.ReadInt32()
 		if dec.Err() != nil {
 			return nil, dec.Err()
 		}

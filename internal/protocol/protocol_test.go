@@ -48,14 +48,87 @@ func TestEncoderDecoder(t *testing.T) {
 	}
 }
 
+func TestVarintRoundTrip(t *testing.T) {
+	var buf bytes.Buffer
+	enc := NewEncoder(&buf)
+
+	enc.WriteVarint(0)
+	enc.WriteVarint(1)
+	enc.WriteVarint(-1)
+	enc.WriteVarint(300)
+	enc.WriteVarint(-300)
+	enc.WriteUvarint(0)
+	enc.WriteUvarint(127)
+	enc.WriteUvarint(128)
+
+	if enc.Err() != nil {
+		t.Fatalf("encode: %v", enc.Err())
+	}
+
+	dec := NewDecoder(&buf)
+	if v := dec.ReadVarint(); v != 0 {
+		t.Errorf("varint 0: got %d", v)
+	}
+	if v := dec.ReadVarint(); v != 1 {
+		t.Errorf("varint 1: got %d", v)
+	}
+	if v := dec.ReadVarint(); v != -1 {
+		t.Errorf("varint -1: got %d", v)
+	}
+	if v := dec.ReadVarint(); v != 300 {
+		t.Errorf("varint 300: got %d", v)
+	}
+	if v := dec.ReadVarint(); v != -300 {
+		t.Errorf("varint -300: got %d", v)
+	}
+	if v := dec.ReadUvarint(); v != 0 {
+		t.Errorf("uvarint 0: got %d", v)
+	}
+	if v := dec.ReadUvarint(); v != 127 {
+		t.Errorf("uvarint 127: got %d", v)
+	}
+	if v := dec.ReadUvarint(); v != 128 {
+		t.Errorf("uvarint 128: got %d", v)
+	}
+	if dec.Err() != nil {
+		t.Fatalf("decode: %v", dec.Err())
+	}
+}
+
+func TestCompactStringRoundTrip(t *testing.T) {
+	var buf bytes.Buffer
+	enc := NewEncoder(&buf)
+
+	enc.WriteCompactString("hello")
+	enc.WriteCompactString("")
+	enc.WriteTaggedFields()
+
+	if enc.Err() != nil {
+		t.Fatalf("encode: %v", enc.Err())
+	}
+
+	dec := NewDecoder(&buf)
+	if v := dec.ReadCompactString(); v != "hello" {
+		t.Errorf("compact string: got %q", v)
+	}
+	if v := dec.ReadCompactString(); v != "" {
+		t.Errorf("empty compact string: got %q", v)
+	}
+	dec.ReadTaggedFields()
+	if dec.Err() != nil {
+		t.Fatalf("decode: %v", dec.Err())
+	}
+}
+
 func TestProduceRequestRoundTrip(t *testing.T) {
 	req := &ProduceRequest{
 		Header: RequestHeader{
 			APIKey:        APIKeyProduce,
-			APIVersion:    0,
+			APIVersion:    3,
 			CorrelationID: 1,
 			ClientID:      "test-client",
 		},
+		Acks:      -1,
 		TimeoutMs: 5000,
 		Topics: []ProduceTopicData{
 			{
@@ -81,6 +154,9 @@ func TestProduceRequestRoundTrip(t *testing.T) {
 	if got.Header.CorrelationID != 1 {
 		t.Errorf("correlationID: %d", got.Header.CorrelationID)
 	}
+	if got.Acks != -1 {
+		t.Errorf("acks: %d", got.Acks)
+	}
 	if got.TimeoutMs != 5000 {
 		t.Errorf("timeoutMs: %d", got.TimeoutMs)
 	}
@@ -96,9 +172,11 @@ func TestFetchRequestRoundTrip(t *testing.T) {
 	req := &FetchRequest{
 		Header: RequestHeader{
 			APIKey:        APIKeyFetch,
+			APIVersion:    4,
 			CorrelationID: 2,
 			ClientID:      "test",
 		},
+		ReplicaID: -1,
 		MaxWaitMs: 500,
 		MinBytes:  1,
 		MaxBytes:  1048576,
@@ -123,6 +201,9 @@ func TestFetchRequestRoundTrip(t *testing.T) {
 	}
 
 	got := decoded.(*FetchRequest)
+	if got.ReplicaID != -1 {
+		t.Errorf("replicaID: %d", got.ReplicaID)
+	}
 	if got.Topics[0].Partitions[0].FetchOffset != 100 {
 		t.Errorf("fetchOffset: %d", got.Topics[0].Partitions[0].FetchOffset)
 	}
@@ -201,7 +282,7 @@ func TestProduceResponseRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	decoded, err := DecodeResponse(APIKeyProduce, data)
+	decoded, err := DecodeResponse(APIKeyProduce, 0, data)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -230,7 +311,7 @@ func TestFetchResponseRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	decoded, err := DecodeResponse(APIKeyFetch, data)
+	decoded, err := DecodeResponse(APIKeyFetch, 0, data)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -238,5 +319,31 @@ func TestFetchResponseRoundTrip(t *testing.T) {
 	got := decoded.(*FetchResponse)
 	if string(got.Topics[0].Partitions[0].RecordBatches) != "batch-data" {
 		t.Errorf("recordBatches: %q", got.Topics[0].Partitions[0].RecordBatches)
+	}
+}
+
+func TestApiVersionsRoundTrip(t *testing.T) {
+	req := &ApiVersionsRequest{
+		Header: RequestHeader{
+			APIKey:        APIKeyApiVersions,
+			APIVersion:    0,
+			CorrelationID: 5,
+			ClientID:      "test",
+		},
+	}
+
+	data, err := EncodeRequest(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	decoded, err := DecodeRequest(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got := decoded.(*ApiVersionsRequest)
+	if got.Header.APIKey != APIKeyApiVersions {
+		t.Errorf("apiKey: %d", got.Header.APIKey)
 	}
 }

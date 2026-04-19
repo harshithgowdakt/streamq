@@ -15,18 +15,20 @@ import (
 
 // Config holds producer configuration.
 type Config struct {
-	BrokerAddr   string
-	BatchSize    int           // max records per batch before flush
-	LingerTime   time.Duration // max time to wait before flush
-	ClientID     string
+	BrokerAddr     string
+	BatchSize      int           // max records per batch before flush
+	LingerTime     time.Duration // max time to wait before flush
+	RequestTimeout time.Duration // max time to wait for ack (0 = 30s)
+	ClientID       string
 }
 
 // DefaultConfig returns sensible defaults.
 func DefaultConfig() Config {
 	return Config{
-		BatchSize:  100,
-		LingerTime: 10 * time.Millisecond,
-		ClientID:   "streamq-producer",
+		BatchSize:      100,
+		LingerTime:     10 * time.Millisecond,
+		RequestTimeout: 30 * time.Second,
+		ClientID:       "streamq-producer",
 	}
 }
 
@@ -91,7 +93,7 @@ func NewProducer(config Config) (*Producer, error) {
 	return p, nil
 }
 
-// Send sends a message and blocks until acknowledged.
+// Send sends a message and blocks until acknowledged or timeout.
 func (p *Producer) Send(msg Message) (int64, error) {
 	if p.closed.Load() {
 		return 0, fmt.Errorf("producer is closed")
@@ -112,8 +114,17 @@ func (p *Producer) Send(msg Message) (int64, error) {
 		}
 	}
 
-	r := <-result
-	return r.Offset, r.Err
+	timeout := p.config.RequestTimeout
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+
+	select {
+	case r := <-result:
+		return r.Offset, r.Err
+	case <-time.After(timeout):
+		return 0, fmt.Errorf("send timeout after %v", timeout)
+	}
 }
 
 func (p *Producer) flusher() {
@@ -173,13 +184,15 @@ func (p *Producer) flush() {
 		}
 	}
 
-	// Build produce request
+	// Build produce request with Kafka wire format
 	req := &protocol.ProduceRequest{
 		Header: protocol.RequestHeader{
 			APIKey:        protocol.APIKeyProduce,
+			APIVersion:    3,
 			CorrelationID: p.nextCorrID(),
 			ClientID:      p.config.ClientID,
 		},
+		Acks:      -1,
 		TimeoutMs: 5000,
 	}
 
@@ -188,7 +201,7 @@ func (p *Producer) flush() {
 		for partID, pb := range partitions {
 			topicData.Partitions = append(topicData.Partitions, protocol.ProducePartitionData{
 				Partition: partID,
-				Records:   pb.batch.Encode(),
+				Records:   protocol.InternalToKafkaRecordBatch(pb.batch),
 			})
 		}
 		req.Topics = append(req.Topics, topicData)
@@ -266,20 +279,25 @@ func (p *Producer) sendRequest(req interface{}) (interface{}, error) {
 		return nil, err
 	}
 
-	// Determine API key from the request
+	// Determine API key and version from the request
 	var apiKey int16
-	switch req.(type) {
+	var apiVersion int16
+	switch r := req.(type) {
 	case *protocol.ProduceRequest:
 		apiKey = protocol.APIKeyProduce
+		apiVersion = r.Header.APIVersion
 	case *protocol.FetchRequest:
 		apiKey = protocol.APIKeyFetch
+		apiVersion = r.Header.APIVersion
 	case *protocol.MetadataRequest:
 		apiKey = protocol.APIKeyMetadata
+		apiVersion = r.Header.APIVersion
 	case *protocol.CreateTopicsRequest:
 		apiKey = protocol.APIKeyCreateTopics
+		apiVersion = r.Header.APIVersion
 	}
 
-	return protocol.DecodeResponse(apiKey, respBody)
+	return protocol.DecodeResponse(apiKey, apiVersion, respBody)
 }
 
 func (p *Producer) nextCorrID() int32 {

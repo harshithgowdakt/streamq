@@ -5,10 +5,10 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/harshithgowda/streamq/internal/log"
 	"github.com/harshithgowda/streamq/internal/protocol"
 )
 
@@ -47,6 +47,7 @@ type Subscription struct {
 type Consumer struct {
 	config        Config
 	conn          net.Conn
+	mu            sync.Mutex
 	subscriptions []Subscription
 	corrID        int32
 }
@@ -66,6 +67,8 @@ func NewConsumer(config Config) (*Consumer, error) {
 
 // Subscribe adds a topic-partition subscription starting at the given offset.
 func (c *Consumer) Subscribe(topic string, partition int32, offset int64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.subscriptions = append(c.subscriptions, Subscription{
 		Topic:     topic,
 		Partition: partition,
@@ -75,6 +78,9 @@ func (c *Consumer) Subscribe(topic string, partition int32, offset int64) {
 
 // Poll sends fetch requests for all subscriptions and returns messages.
 func (c *Consumer) Poll() ([]Message, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	if len(c.subscriptions) == 0 {
 		return nil, nil
 	}
@@ -98,10 +104,12 @@ func (c *Consumer) Poll() ([]Message, error) {
 	req := &protocol.FetchRequest{
 		Header: protocol.RequestHeader{
 			APIKey:        protocol.APIKeyFetch,
+			APIVersion:    4,
 			CorrelationID: c.nextCorrID(),
 			ClientID:      c.config.ClientID,
 		},
-		MaxBytes: c.config.MaxBytes,
+		ReplicaID: -1,
+		MaxBytes:  c.config.MaxBytes,
 	}
 
 	for topic, partitions := range topicMap {
@@ -120,10 +128,29 @@ func (c *Consumer) Poll() ([]Message, error) {
 	fetchResp := resp.(*protocol.FetchResponse)
 
 	var messages []Message
+	var firstErr error
 
 	for _, topicResp := range fetchResp.Topics {
 		for _, partResp := range topicResp.Partitions {
+			if partResp.ErrorCode == protocol.ErrOffsetOutOfRange {
+				if firstErr == nil {
+					firstErr = fmt.Errorf("partition %s-%d: offset out of range",
+						topicResp.Topic, partResp.Partition)
+				}
+				continue
+			}
+			if partResp.ErrorCode == protocol.ErrCorruptMessage {
+				if firstErr == nil {
+					firstErr = fmt.Errorf("partition %s-%d: corrupt message",
+						topicResp.Topic, partResp.Partition)
+				}
+				continue
+			}
 			if partResp.ErrorCode != protocol.ErrNone {
+				if firstErr == nil {
+					firstErr = fmt.Errorf("partition %s-%d: error code %d",
+						topicResp.Topic, partResp.Partition, partResp.ErrorCode)
+				}
 				continue
 			}
 
@@ -131,20 +158,17 @@ func (c *Consumer) Poll() ([]Message, error) {
 				continue
 			}
 
-			// Decode all batches from the raw bytes
-			data := partResp.RecordBatches
-			for len(data) >= 12 { // minimum: BaseOffset(8) + BatchLength(4)
-				batchLen := int32(binary.BigEndian.Uint32(data[8:12]))
-				totalSize := 12 + int(batchLen)
-				if totalSize > len(data) {
-					break
+			// Decode Kafka RecordBatch format
+			batches, err := protocol.KafkaRecordBatchToInternal(partResp.RecordBatches)
+			if err != nil {
+				if firstErr == nil {
+					firstErr = fmt.Errorf("partition %s-%d: decode record batch: %w",
+						topicResp.Topic, partResp.Partition, err)
 				}
+				continue
+			}
 
-				batch, err := log.DecodeRecordBatch(data[:totalSize])
-				if err != nil {
-					break
-				}
-
+			for _, batch := range batches {
 				for i, rec := range batch.Records {
 					messages = append(messages, Message{
 						Topic:     topicResp.Topic,
@@ -159,13 +183,11 @@ func (c *Consumer) Poll() ([]Message, error) {
 				if idx, ok := subIdx[topicResp.Topic][partResp.Partition]; ok {
 					c.subscriptions[idx].Offset = batch.BaseOffset + int64(len(batch.Records))
 				}
-
-				data = data[totalSize:]
 			}
 		}
 	}
 
-	return messages, nil
+	return messages, firstErr
 }
 
 func (c *Consumer) sendRequest(req interface{}) (interface{}, error) {
@@ -192,14 +214,17 @@ func (c *Consumer) sendRequest(req interface{}) (interface{}, error) {
 	}
 
 	var apiKey int16
-	switch req.(type) {
+	var apiVersion int16
+	switch r := req.(type) {
 	case *protocol.FetchRequest:
 		apiKey = protocol.APIKeyFetch
+		apiVersion = r.Header.APIVersion
 	case *protocol.MetadataRequest:
 		apiKey = protocol.APIKeyMetadata
+		apiVersion = r.Header.APIVersion
 	}
 
-	return protocol.DecodeResponse(apiKey, respBody)
+	return protocol.DecodeResponse(apiKey, apiVersion, respBody)
 }
 
 func (c *Consumer) nextCorrID() int32 {

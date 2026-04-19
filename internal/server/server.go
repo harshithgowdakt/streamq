@@ -7,6 +7,7 @@ import (
 	"log"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/harshithgowda/streamq/internal/broker"
 	"github.com/harshithgowda/streamq/internal/protocol"
@@ -101,11 +102,16 @@ func (s *Server) handleConnection(conn net.Conn) {
 			return
 		}
 
-		// Dispatch to broker
-		resp, err := s.broker.Dispatch(req)
-		if err != nil {
-			log.Printf("dispatch: %v", err)
-			return
+		// Handle fetch with MinBytes/MaxWaitMs polling
+		var resp interface{}
+		if fetchReq, ok := req.(*protocol.FetchRequest); ok {
+			resp = s.handleFetchWithWait(fetchReq)
+		} else {
+			resp, err = s.broker.Dispatch(req)
+			if err != nil {
+				log.Printf("dispatch: %v", err)
+				return
+			}
 		}
 
 		// Encode response
@@ -125,6 +131,56 @@ func (s *Server) handleConnection(conn net.Conn) {
 			return
 		}
 	}
+}
+
+// handleFetchWithWait implements Kafka's MinBytes/MaxWaitMs semantics:
+// it polls the broker until MinBytes of data is available or MaxWaitMs expires.
+func (s *Server) handleFetchWithWait(req *protocol.FetchRequest) *protocol.FetchResponse {
+	resp := s.broker.HandleFetch(req)
+
+	minBytes := int(req.MinBytes)
+	maxWaitMs := int(req.MaxWaitMs)
+
+	// If we already have enough data or no wait requested, return immediately
+	if minBytes <= 0 || maxWaitMs <= 0 || totalFetchBytes(resp) >= minBytes {
+		return resp
+	}
+
+	// Poll until MinBytes satisfied or MaxWaitMs elapsed
+	deadline := time.Now().Add(time.Duration(maxWaitMs) * time.Millisecond)
+	pollInterval := 10 * time.Millisecond
+
+	for totalFetchBytes(resp) < minBytes {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			break
+		}
+
+		wait := pollInterval
+		if wait > remaining {
+			wait = remaining
+		}
+
+		select {
+		case <-time.After(wait):
+		case <-s.quit:
+			return resp
+		}
+
+		resp = s.broker.HandleFetch(req)
+	}
+
+	return resp
+}
+
+func totalFetchBytes(resp *protocol.FetchResponse) int {
+	total := 0
+	for _, t := range resp.Topics {
+		for _, p := range t.Partitions {
+			total += len(p.RecordBatches)
+		}
+	}
+	return total
 }
 
 // Stop gracefully shuts down the server.
