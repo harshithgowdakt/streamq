@@ -182,6 +182,40 @@ func (s *Segment) Append(batch *RecordBatch) (int64, error) {
 	return assignedOffset, nil
 }
 
+// AppendReplica writes a RecordBatch preserving its existing BaseOffset (for replication).
+func (s *Segment) AppendReplica(batch *RecordBatch) (int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Validate offset continuity
+	if batch.BaseOffset != s.nextOffset {
+		return 0, fmt.Errorf("offset discontinuity: expected %d, got %d", s.nextOffset, batch.BaseOffset)
+	}
+
+	data := batch.Encode()
+
+	// Write sparse index entry if needed
+	if s.bytesSinceIndex >= sparseIndexInterval || s.position == 0 {
+		relOff := uint32(batch.BaseOffset - s.baseOffset)
+		if err := s.index.Write(relOff, uint64(s.position)); err != nil {
+			return 0, fmt.Errorf("write index: %w", err)
+		}
+		s.bytesSinceIndex = 0
+	}
+
+	n, err := s.logFile.Write(data)
+	if err != nil {
+		return 0, fmt.Errorf("write log: %w", err)
+	}
+
+	assignedOffset := batch.BaseOffset
+	s.nextOffset = batch.BaseOffset + int64(len(batch.Records))
+	s.position += int64(n)
+	s.bytesSinceIndex += int64(n)
+
+	return assignedOffset, nil
+}
+
 // Read reads record batches starting from the given offset.
 // Returns up to maxBytes of data.
 // Returns ErrOffsetOutOfRange if offset is before baseOffset.

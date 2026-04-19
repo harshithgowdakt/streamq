@@ -11,9 +11,13 @@ const (
 	APIKeyFetch           int16 = 1
 	APIKeyListOffsets     int16 = 2
 	APIKeyMetadata        int16 = 3
+	APIKeyOffsetCommit    int16 = 8
 	APIKeyOffsetFetch     int16 = 9
 	APIKeyFindCoordinator int16 = 10
 	APIKeyJoinGroup       int16 = 11
+	APIKeyHeartbeat       int16 = 12
+	APIKeyLeaveGroup      int16 = 13
+	APIKeySyncGroup       int16 = 14
 	APIKeyApiVersions     int16 = 18
 	APIKeyCreateTopics    int16 = 19
 )
@@ -28,9 +32,16 @@ const (
 	ErrInvalidMessage     int16 = 4
 	ErrGroupCoordinatorNotAvailable int16 = 15
 	ErrNotCoordinator     int16 = 16
-	ErrUnsupportedVersion int16 = 35
-	ErrTopicAlreadyExists int16 = 36
-	ErrInvalidPartitions  int16 = 37
+	ErrNotLeaderForPartition int16 = 6
+	ErrRequestTimedOut       int16 = 7
+	ErrNotEnoughReplicas     int16 = 19
+	ErrIllegalGeneration         int16 = 22
+	ErrInconsistentGroupProtocol int16 = 23
+	ErrUnknownMemberID           int16 = 25
+	ErrRebalanceInProgress       int16 = 27
+	ErrUnsupportedVersion        int16 = 35
+	ErrTopicAlreadyExists        int16 = 36
+	ErrInvalidPartitions         int16 = 37
 )
 
 // RequestHeader is the common header for all requests.
@@ -256,14 +267,119 @@ type FindCoordinatorResponse struct {
 
 // --- JoinGroup ---
 
+type JoinGroupProtocol struct {
+	Name     string
+	Metadata []byte
+}
+
 type JoinGroupRequest struct {
-	Header RequestHeader
-	// We only need to read enough to return an error
+	Header             RequestHeader
+	GroupID            string
+	SessionTimeoutMs   int32
+	RebalanceTimeoutMs int32 // v1+
+	MemberID           string
+	ProtocolType       string
+	Protocols          []JoinGroupProtocol
+}
+
+type JoinGroupMember struct {
+	MemberID string
+	Metadata []byte
 }
 
 type JoinGroupResponse struct {
 	Header       ResponseHeader
 	ErrorCode    int16
+	GenerationID int32
+	ProtocolName string
+	Leader       string
+	MemberID     string
+	Members      []JoinGroupMember
+}
+
+// --- SyncGroup ---
+
+type SyncGroupAssignment struct {
+	MemberID   string
+	Assignment []byte
+}
+
+type SyncGroupRequest struct {
+	Header       RequestHeader
+	GroupID      string
+	GenerationID int32
+	MemberID     string
+	Assignments  []SyncGroupAssignment
+}
+
+type SyncGroupResponse struct {
+	Header     ResponseHeader
+	ErrorCode  int16
+	Assignment []byte
+}
+
+// --- Heartbeat ---
+
+type HeartbeatRequest struct {
+	Header       RequestHeader
+	GroupID      string
+	GenerationID int32
+	MemberID     string
+}
+
+type HeartbeatResponse struct {
+	Header    ResponseHeader
+	ErrorCode int16
+}
+
+// --- LeaveGroup ---
+
+type LeaveGroupRequest struct {
+	Header   RequestHeader
+	GroupID  string
+	MemberID string
+}
+
+type LeaveGroupResponse struct {
+	Header    ResponseHeader
+	ErrorCode int16
+}
+
+// --- OffsetCommit ---
+
+type OffsetCommitPartition struct {
+	Partition int32
+	Offset    int64
+	Metadata  *string
+}
+
+type OffsetCommitTopic struct {
+	Topic      string
+	Partitions []OffsetCommitPartition
+}
+
+type OffsetCommitRequest struct {
+	Header       RequestHeader
+	GroupID      string
+	GenerationID int32
+	MemberID     string
+	RetentionMs  int64
+	Topics       []OffsetCommitTopic
+}
+
+type OffsetCommitPartitionResponse struct {
+	Partition int32
+	ErrorCode int16
+}
+
+type OffsetCommitTopicResponse struct {
+	Topic      string
+	Partitions []OffsetCommitPartitionResponse
+}
+
+type OffsetCommitResponse struct {
+	Header ResponseHeader
+	Topics []OffsetCommitTopicResponse
 }
 
 // --- OffsetFetch ---
@@ -379,6 +495,62 @@ func EncodeRequest(req interface{}) ([]byte, error) {
 	case *FindCoordinatorRequest:
 		encodeRequestHeader(enc, &r.Header)
 		enc.WriteString(r.Key)
+
+	case *JoinGroupRequest:
+		encodeRequestHeader(enc, &r.Header)
+		enc.WriteString(r.GroupID)
+		enc.WriteInt32(r.SessionTimeoutMs)
+		if r.Header.APIVersion >= 1 {
+			enc.WriteInt32(r.RebalanceTimeoutMs)
+		}
+		enc.WriteString(r.MemberID)
+		enc.WriteString(r.ProtocolType)
+		enc.WriteInt32(int32(len(r.Protocols)))
+		for _, p := range r.Protocols {
+			enc.WriteString(p.Name)
+			enc.WriteBytes(p.Metadata)
+		}
+
+	case *SyncGroupRequest:
+		encodeRequestHeader(enc, &r.Header)
+		enc.WriteString(r.GroupID)
+		enc.WriteInt32(r.GenerationID)
+		enc.WriteString(r.MemberID)
+		enc.WriteInt32(int32(len(r.Assignments)))
+		for _, a := range r.Assignments {
+			enc.WriteString(a.MemberID)
+			enc.WriteBytes(a.Assignment)
+		}
+
+	case *HeartbeatRequest:
+		encodeRequestHeader(enc, &r.Header)
+		enc.WriteString(r.GroupID)
+		enc.WriteInt32(r.GenerationID)
+		enc.WriteString(r.MemberID)
+
+	case *LeaveGroupRequest:
+		encodeRequestHeader(enc, &r.Header)
+		enc.WriteString(r.GroupID)
+		enc.WriteString(r.MemberID)
+
+	case *OffsetCommitRequest:
+		encodeRequestHeader(enc, &r.Header)
+		enc.WriteString(r.GroupID)
+		enc.WriteInt32(r.GenerationID)
+		enc.WriteString(r.MemberID)
+		if r.Header.APIVersion >= 2 {
+			enc.WriteInt64(r.RetentionMs)
+		}
+		enc.WriteInt32(int32(len(r.Topics)))
+		for _, t := range r.Topics {
+			enc.WriteString(t.Topic)
+			enc.WriteInt32(int32(len(t.Partitions)))
+			for _, p := range t.Partitions {
+				enc.WriteInt32(p.Partition)
+				enc.WriteInt64(p.Offset)
+				enc.WriteNullableString(p.Metadata)
+			}
+		}
 
 	case *OffsetFetchRequest:
 		encodeRequestHeader(enc, &r.Header)
@@ -558,7 +730,84 @@ func DecodeRequest(data []byte) (interface{}, error) {
 
 	case APIKeyJoinGroup:
 		req := &JoinGroupRequest{Header: header}
-		// We just need the header to return an error
+		req.GroupID = dec.ReadString()
+		req.SessionTimeoutMs = dec.ReadInt32()
+		if header.APIVersion >= 1 {
+			req.RebalanceTimeoutMs = dec.ReadInt32()
+		} else {
+			req.RebalanceTimeoutMs = req.SessionTimeoutMs
+		}
+		req.MemberID = dec.ReadString()
+		req.ProtocolType = dec.ReadString()
+		protocolCount := dec.ReadInt32()
+		req.Protocols = make([]JoinGroupProtocol, protocolCount)
+		for i := range req.Protocols {
+			req.Protocols[i].Name = dec.ReadString()
+			req.Protocols[i].Metadata = dec.ReadBytes()
+		}
+		if dec.Err() != nil {
+			return nil, dec.Err()
+		}
+		return req, nil
+
+	case APIKeySyncGroup:
+		req := &SyncGroupRequest{Header: header}
+		req.GroupID = dec.ReadString()
+		req.GenerationID = dec.ReadInt32()
+		req.MemberID = dec.ReadString()
+		assignmentCount := dec.ReadInt32()
+		req.Assignments = make([]SyncGroupAssignment, assignmentCount)
+		for i := range req.Assignments {
+			req.Assignments[i].MemberID = dec.ReadString()
+			req.Assignments[i].Assignment = dec.ReadBytes()
+		}
+		if dec.Err() != nil {
+			return nil, dec.Err()
+		}
+		return req, nil
+
+	case APIKeyHeartbeat:
+		req := &HeartbeatRequest{Header: header}
+		req.GroupID = dec.ReadString()
+		req.GenerationID = dec.ReadInt32()
+		req.MemberID = dec.ReadString()
+		if dec.Err() != nil {
+			return nil, dec.Err()
+		}
+		return req, nil
+
+	case APIKeyLeaveGroup:
+		req := &LeaveGroupRequest{Header: header}
+		req.GroupID = dec.ReadString()
+		req.MemberID = dec.ReadString()
+		if dec.Err() != nil {
+			return nil, dec.Err()
+		}
+		return req, nil
+
+	case APIKeyOffsetCommit:
+		req := &OffsetCommitRequest{Header: header}
+		req.GroupID = dec.ReadString()
+		req.GenerationID = dec.ReadInt32()
+		req.MemberID = dec.ReadString()
+		if header.APIVersion >= 2 {
+			req.RetentionMs = dec.ReadInt64()
+		}
+		topicCount := dec.ReadInt32()
+		req.Topics = make([]OffsetCommitTopic, topicCount)
+		for i := range req.Topics {
+			req.Topics[i].Topic = dec.ReadString()
+			partCount := dec.ReadInt32()
+			req.Topics[i].Partitions = make([]OffsetCommitPartition, partCount)
+			for j := range req.Topics[i].Partitions {
+				req.Topics[i].Partitions[j].Partition = dec.ReadInt32()
+				req.Topics[i].Partitions[j].Offset = dec.ReadInt64()
+				req.Topics[i].Partitions[j].Metadata = dec.ReadNullableString()
+			}
+		}
+		if dec.Err() != nil {
+			return nil, dec.Err()
+		}
 		return req, nil
 
 	case APIKeyOffsetFetch:
@@ -701,11 +950,40 @@ func EncodeResponse(resp interface{}) ([]byte, error) {
 	case *JoinGroupResponse:
 		enc.WriteInt32(r.Header.CorrelationID)
 		enc.WriteInt16(r.ErrorCode)
-		enc.WriteInt32(-1)         // generationId
-		enc.WriteString("")        // protocolName
-		enc.WriteString("")        // leader
-		enc.WriteString("")        // memberId
-		enc.WriteInt32(0)          // members count
+		enc.WriteInt32(r.GenerationID)
+		enc.WriteString(r.ProtocolName)
+		enc.WriteString(r.Leader)
+		enc.WriteString(r.MemberID)
+		enc.WriteInt32(int32(len(r.Members)))
+		for _, m := range r.Members {
+			enc.WriteString(m.MemberID)
+			enc.WriteBytes(m.Metadata)
+		}
+
+	case *SyncGroupResponse:
+		enc.WriteInt32(r.Header.CorrelationID)
+		enc.WriteInt16(r.ErrorCode)
+		enc.WriteBytes(r.Assignment)
+
+	case *HeartbeatResponse:
+		enc.WriteInt32(r.Header.CorrelationID)
+		enc.WriteInt16(r.ErrorCode)
+
+	case *LeaveGroupResponse:
+		enc.WriteInt32(r.Header.CorrelationID)
+		enc.WriteInt16(r.ErrorCode)
+
+	case *OffsetCommitResponse:
+		enc.WriteInt32(r.Header.CorrelationID)
+		enc.WriteInt32(int32(len(r.Topics)))
+		for _, t := range r.Topics {
+			enc.WriteString(t.Topic)
+			enc.WriteInt32(int32(len(t.Partitions)))
+			for _, p := range t.Partitions {
+				enc.WriteInt32(p.Partition)
+				enc.WriteInt16(p.ErrorCode)
+			}
+		}
 
 	case *OffsetFetchResponse:
 		enc.WriteInt32(r.Header.CorrelationID)
@@ -882,6 +1160,87 @@ func DecodeResponse(apiKey int16, apiVersion int16, data []byte) (interface{}, e
 		resp.NodeID = dec.ReadInt32()
 		resp.Host = dec.ReadString()
 		resp.Port = dec.ReadInt32()
+		if dec.Err() != nil {
+			return nil, dec.Err()
+		}
+		return resp, nil
+
+	case APIKeyJoinGroup:
+		resp := &JoinGroupResponse{Header: ResponseHeader{CorrelationID: correlationID}}
+		resp.ErrorCode = dec.ReadInt16()
+		resp.GenerationID = dec.ReadInt32()
+		resp.ProtocolName = dec.ReadString()
+		resp.Leader = dec.ReadString()
+		resp.MemberID = dec.ReadString()
+		memberCount := dec.ReadInt32()
+		resp.Members = make([]JoinGroupMember, memberCount)
+		for i := range resp.Members {
+			resp.Members[i].MemberID = dec.ReadString()
+			resp.Members[i].Metadata = dec.ReadBytes()
+		}
+		if dec.Err() != nil {
+			return nil, dec.Err()
+		}
+		return resp, nil
+
+	case APIKeySyncGroup:
+		resp := &SyncGroupResponse{Header: ResponseHeader{CorrelationID: correlationID}}
+		resp.ErrorCode = dec.ReadInt16()
+		resp.Assignment = dec.ReadBytes()
+		if dec.Err() != nil {
+			return nil, dec.Err()
+		}
+		return resp, nil
+
+	case APIKeyHeartbeat:
+		resp := &HeartbeatResponse{Header: ResponseHeader{CorrelationID: correlationID}}
+		resp.ErrorCode = dec.ReadInt16()
+		if dec.Err() != nil {
+			return nil, dec.Err()
+		}
+		return resp, nil
+
+	case APIKeyLeaveGroup:
+		resp := &LeaveGroupResponse{Header: ResponseHeader{CorrelationID: correlationID}}
+		resp.ErrorCode = dec.ReadInt16()
+		if dec.Err() != nil {
+			return nil, dec.Err()
+		}
+		return resp, nil
+
+	case APIKeyOffsetCommit:
+		resp := &OffsetCommitResponse{Header: ResponseHeader{CorrelationID: correlationID}}
+		topicCount := dec.ReadInt32()
+		resp.Topics = make([]OffsetCommitTopicResponse, topicCount)
+		for i := range resp.Topics {
+			resp.Topics[i].Topic = dec.ReadString()
+			partCount := dec.ReadInt32()
+			resp.Topics[i].Partitions = make([]OffsetCommitPartitionResponse, partCount)
+			for j := range resp.Topics[i].Partitions {
+				resp.Topics[i].Partitions[j].Partition = dec.ReadInt32()
+				resp.Topics[i].Partitions[j].ErrorCode = dec.ReadInt16()
+			}
+		}
+		if dec.Err() != nil {
+			return nil, dec.Err()
+		}
+		return resp, nil
+
+	case APIKeyOffsetFetch:
+		resp := &OffsetFetchResponse{Header: ResponseHeader{CorrelationID: correlationID}}
+		topicCount := dec.ReadInt32()
+		resp.Topics = make([]OffsetFetchTopicResponse, topicCount)
+		for i := range resp.Topics {
+			resp.Topics[i].Topic = dec.ReadString()
+			partCount := dec.ReadInt32()
+			resp.Topics[i].Partitions = make([]OffsetFetchPartitionResponse, partCount)
+			for j := range resp.Topics[i].Partitions {
+				resp.Topics[i].Partitions[j].Partition = dec.ReadInt32()
+				resp.Topics[i].Partitions[j].CommittedOffset = dec.ReadInt64()
+				resp.Topics[i].Partitions[j].Metadata = dec.ReadNullableString()
+				resp.Topics[i].Partitions[j].ErrorCode = dec.ReadInt16()
+			}
+		}
 		if dec.Err() != nil {
 			return nil, dec.Err()
 		}

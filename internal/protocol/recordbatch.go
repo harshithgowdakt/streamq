@@ -119,8 +119,14 @@ func KafkaRecordBatchToInternal(data []byte) ([]*log.RecordBatch, error) {
 }
 
 // InternalToKafkaRecordBatch converts an internal log.RecordBatch to Kafka wire
-// format (magic=2 RecordBatch).
+// format (magic=2 RecordBatch). Uses leader epoch 0.
 func InternalToKafkaRecordBatch(batch *log.RecordBatch) []byte {
+	return InternalToKafkaRecordBatchWithEpoch(batch, 0)
+}
+
+// InternalToKafkaRecordBatchWithEpoch converts an internal log.RecordBatch to Kafka wire
+// format (magic=2 RecordBatch) with the specified leader epoch.
+func InternalToKafkaRecordBatchWithEpoch(batch *log.RecordBatch, leaderEpoch int32) []byte {
 	now := time.Now().UnixMilli()
 
 	// Encode records into varint format first
@@ -211,7 +217,7 @@ func InternalToKafkaRecordBatch(batch *log.RecordBatch) []byte {
 	pos += 4
 
 	// PartitionLeaderEpoch
-	binary.BigEndian.PutUint32(buf[pos:], 0)
+	binary.BigEndian.PutUint32(buf[pos:], uint32(leaderEpoch))
 	pos += 4
 
 	// Magic

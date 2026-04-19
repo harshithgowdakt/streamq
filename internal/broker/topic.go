@@ -114,6 +114,47 @@ func (tm *TopicManager) EnforceRetention() {
 	}
 }
 
+// CreateLocalPartition creates a single partition for a topic if it doesn't exist.
+// Used by cluster mode when receiving partition assignments.
+func (tm *TopicManager) CreateLocalPartition(topicName string, partitionID int32) error {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+
+	topic, ok := tm.topics[topicName]
+	if !ok {
+		topic = &Topic{
+			Name:       topicName,
+			Partitions: make([]*Partition, 0),
+		}
+		tm.topics[topicName] = topic
+	}
+
+	// Check if partition already exists
+	for _, p := range topic.Partitions {
+		if p.ID == partitionID {
+			return nil // already exists
+		}
+	}
+
+	dir := filepath.Join(tm.dataDir, fmt.Sprintf("%s-%d", topicName, partitionID))
+	cl, err := log.NewCommitLog(dir, tm.logConfig)
+	if err != nil {
+		return fmt.Errorf("create partition %d: %w", partitionID, err)
+	}
+
+	p := &Partition{ID: partitionID, Log: cl}
+	topic.Partitions = append(topic.Partitions, p)
+
+	// Sort partitions by ID to maintain order
+	for i := len(topic.Partitions) - 1; i > 0; i-- {
+		if topic.Partitions[i].ID < topic.Partitions[i-1].ID {
+			topic.Partitions[i], topic.Partitions[i-1] = topic.Partitions[i-1], topic.Partitions[i]
+		}
+	}
+
+	return nil
+}
+
 // Close closes all partition logs.
 func (tm *TopicManager) Close() error {
 	tm.mu.Lock()

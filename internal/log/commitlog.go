@@ -129,6 +129,26 @@ func (cl *CommitLog) Append(batch *RecordBatch) (int64, error) {
 	return offset, nil
 }
 
+// AppendReplica writes a RecordBatch preserving its BaseOffset (for replication).
+func (cl *CommitLog) AppendReplica(batch *RecordBatch) (int64, error) {
+	cl.mu.Lock()
+	defer cl.mu.Unlock()
+
+	// Roll segment if active exceeds max size
+	if cl.active.Size() >= cl.config.MaxSegmentBytes {
+		if err := cl.rollSegment(); err != nil {
+			return 0, fmt.Errorf("roll segment: %w", err)
+		}
+	}
+
+	offset, err := cl.active.AppendReplica(batch)
+	if err != nil {
+		return 0, err
+	}
+
+	return offset, nil
+}
+
 // rollSegment creates a new segment starting at the active segment's next offset.
 func (cl *CommitLog) rollSegment() error {
 	nextBase := cl.active.NextOffset()

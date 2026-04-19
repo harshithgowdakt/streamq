@@ -17,6 +17,8 @@ func main() {
 	defaultPartitions := flag.Int("default-partitions", 1, "default number of partitions for auto-created topics")
 	maxSegmentBytes := flag.Int64("max-segment-bytes", 1024*1024*1024, "max segment size in bytes")
 	autoCreate := flag.Bool("auto-create-topics", true, "auto-create topics on produce")
+	controllerAddr := flag.String("controller-addr", "", "controller RPC address (empty = single-node mode)")
+	nodeID := flag.Int("node-id", 0, "broker node ID (ignored in cluster mode, assigned by controller)")
 	flag.Parse()
 
 	cfg := broker.Config{
@@ -25,9 +27,18 @@ func main() {
 		MaxSegmentBytes:   *maxSegmentBytes,
 		AutoCreateTopics:  *autoCreate,
 		Addr:              *addr,
+		ControllerAddr:    *controllerAddr,
+		NodeID:            int32(*nodeID),
 	}
 
 	b := broker.NewBroker(cfg)
+
+	// Connect to controller if in cluster mode
+	if cfg.ControllerAddr != "" {
+		if err := b.ConnectToController(); err != nil {
+			log.Fatalf("failed to connect to controller: %v", err)
+		}
+	}
 
 	srv := server.NewServer(b)
 	if err := srv.Start(*addr); err != nil {

@@ -3,17 +3,16 @@ package broker
 import (
 	"errors"
 	"fmt"
-	"net"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/harshithgowda/streamq/internal/cluster"
 	"github.com/harshithgowda/streamq/internal/log"
 	"github.com/harshithgowda/streamq/internal/protocol"
 )
 
 // HandleProduce processes a ProduceRequest.
-// Accepts Kafka RecordBatch wire format (magic=2) and translates to internal format.
 func (b *Broker) HandleProduce(req *protocol.ProduceRequest) *protocol.ProduceResponse {
 	resp := &protocol.ProduceResponse{
 		Header:  protocol.ResponseHeader{CorrelationID: req.Header.CorrelationID},
@@ -26,12 +25,34 @@ func (b *Broker) HandleProduce(req *protocol.ProduceRequest) *protocol.ProduceRe
 		for _, partData := range topicData.Partitions {
 			partResp := protocol.ProducePartitionResponse{Partition: partData.Partition}
 
+			// In cluster mode, reject if not leader
+			if b.clusterMode {
+				state := b.GetPartitionState(topicData.Topic, partData.Partition)
+				if state == nil || state.GetRole() != RoleLeader {
+					partResp.ErrorCode = protocol.ErrNotLeaderForPartition
+					topicResp.Partitions = append(topicResp.Partitions, partResp)
+					continue
+				}
+				// Epoch check
+				if state.GetEpoch() < 0 {
+					partResp.ErrorCode = protocol.ErrNotLeaderForPartition
+					topicResp.Partitions = append(topicResp.Partitions, partResp)
+					continue
+				}
+			}
+
 			// Auto-create topic if enabled
 			partition, err := b.TopicManager.GetPartition(topicData.Topic, partData.Partition)
 			if err != nil && b.Config.AutoCreateTopics {
-				createErr := b.TopicManager.CreateTopic(topicData.Topic, b.Config.DefaultPartitions)
-				if createErr == nil || strings.Contains(createErr.Error(), "already exists") {
+				if b.clusterMode && b.controllerClient != nil {
+					_ = b.controllerClient.CreateTopic(topicData.Topic, b.Config.DefaultPartitions, 3)
+					time.Sleep(100 * time.Millisecond) // wait for metadata propagation
 					partition, err = b.TopicManager.GetPartition(topicData.Topic, partData.Partition)
+				} else {
+					createErr := b.TopicManager.CreateTopic(topicData.Topic, b.Config.DefaultPartitions)
+					if createErr == nil || strings.Contains(createErr.Error(), "already exists") {
+						partition, err = b.TopicManager.GetPartition(topicData.Topic, partData.Partition)
+					}
 				}
 			}
 			if err != nil {
@@ -42,9 +63,9 @@ func (b *Broker) HandleProduce(req *protocol.ProduceRequest) *protocol.ProduceRe
 
 			// Try Kafka RecordBatch format first, fall back to internal format
 			var firstOffset int64 = -1
+			var recordCount int
 			batches, kafkaErr := protocol.KafkaRecordBatchToInternal(partData.Records)
 			if kafkaErr == nil {
-				// Kafka wire format
 				for _, batch := range batches {
 					baseOffset, appErr := partition.Log.Append(batch)
 					if appErr != nil {
@@ -54,9 +75,9 @@ func (b *Broker) HandleProduce(req *protocol.ProduceRequest) *protocol.ProduceRe
 					if firstOffset < 0 {
 						firstOffset = baseOffset
 					}
+					recordCount += len(batch.Records)
 				}
 			} else {
-				// Fallback: try internal format (for legacy custom clients)
 				data := partData.Records
 				for len(data) >= 12 {
 					batchLen := int32(data[8])<<24 | int32(data[9])<<16 | int32(data[10])<<8 | int32(data[11])
@@ -80,6 +101,7 @@ func (b *Broker) HandleProduce(req *protocol.ProduceRequest) *protocol.ProduceRe
 					if firstOffset < 0 {
 						firstOffset = baseOffset
 					}
+					recordCount += len(batch.Records)
 					data = data[totalSize:]
 				}
 			}
@@ -93,6 +115,26 @@ func (b *Broker) HandleProduce(req *protocol.ProduceRequest) *protocol.ProduceRe
 				if req.Header.APIVersion >= 2 {
 					partResp.LogAppendTimeMs = time.Now().UnixMilli()
 				}
+
+				// For acks=-1, wait until HWM advances past our records
+				if b.clusterMode && req.Acks == -1 && recordCount > 0 {
+					state := b.GetPartitionState(topicData.Topic, partData.Partition)
+					if state != nil {
+						targetOffset := firstOffset + int64(recordCount)
+						ok := state.WaitForHWM(targetOffset, time.Duration(req.TimeoutMs)*time.Millisecond)
+						if !ok {
+							// Check min ISR
+							state.mu.RLock()
+							isrLen := len(state.ISR)
+							state.mu.RUnlock()
+							if isrLen < 2 { // min.isr = 2
+								partResp.ErrorCode = protocol.ErrNotEnoughReplicas
+							} else {
+								partResp.ErrorCode = protocol.ErrRequestTimedOut
+							}
+						}
+					}
+				}
 			}
 			topicResp.Partitions = append(topicResp.Partitions, partResp)
 		}
@@ -104,7 +146,6 @@ func (b *Broker) HandleProduce(req *protocol.ProduceRequest) *protocol.ProduceRe
 }
 
 // HandleFetch processes a FetchRequest.
-// Returns Kafka RecordBatch wire format (magic=2).
 func (b *Broker) HandleFetch(req *protocol.FetchRequest) *protocol.FetchResponse {
 	return b.doFetch(req)
 }
@@ -114,6 +155,8 @@ func (b *Broker) doFetch(req *protocol.FetchRequest) *protocol.FetchResponse {
 		Header:  protocol.ResponseHeader{CorrelationID: req.Header.CorrelationID},
 		Version: req.Header.APIVersion,
 	}
+
+	isReplicaFetch := req.ReplicaID >= 0
 
 	for _, topicData := range req.Topics {
 		topicResp := protocol.FetchTopicResponse{Topic: topicData.Topic}
@@ -146,14 +189,47 @@ func (b *Broker) doFetch(req *protocol.FetchRequest) *protocol.FetchResponse {
 				continue
 			}
 
-			// Encode all batches into Kafka RecordBatch wire format
 			var raw []byte
 			for _, batch := range batches {
 				raw = append(raw, protocol.InternalToKafkaRecordBatch(batch)...)
 			}
 
 			partResp.ErrorCode = protocol.ErrNone
-			partResp.HighWatermark = partition.Log.NextOffset()
+
+			if b.clusterMode {
+				state := b.GetPartitionState(topicData.Topic, partData.Partition)
+				if state != nil {
+					if isReplicaFetch {
+						// Replica fetch: return data up to LEO, update replica tracking
+						partResp.HighWatermark = partition.Log.NextOffset()
+
+						followerID := cluster.BrokerID(req.ReplicaID)
+						fetchEnd := partData.FetchOffset
+						if len(batches) > 0 {
+							last := batches[len(batches)-1]
+							fetchEnd = last.BaseOffset + int64(len(last.Records))
+						}
+						state.UpdateReplicaLEO(followerID, fetchEnd)
+						state.UpdateHWM(partition.Log.NextOffset())
+					} else {
+						// Consumer fetch: return data up to HWM
+						hwm := state.GetHWM()
+						partResp.HighWatermark = hwm
+						// Filter batches to only include up to HWM
+						raw = nil
+						for _, batch := range batches {
+							if batch.BaseOffset < hwm {
+								raw = append(raw, protocol.InternalToKafkaRecordBatch(batch)...)
+							}
+						}
+					}
+				} else {
+					partResp.HighWatermark = partition.Log.NextOffset()
+				}
+			} else {
+				partResp.HighWatermark = partition.Log.NextOffset()
+			}
+
 			partResp.RecordBatches = raw
 			topicResp.Partitions = append(topicResp.Partitions, partResp)
 		}
@@ -182,19 +258,77 @@ func (b *Broker) HandleMetadata(req *protocol.MetadataRequest) *protocol.Metadat
 		Version: req.Header.APIVersion,
 	}
 
-	// Parse broker address for metadata
+	if b.clusterMode {
+		meta := b.GetClusterMetadata()
+		if meta != nil {
+			// Build broker list from cluster metadata
+			for _, bi := range meta.Brokers {
+				resp.Brokers = append(resp.Brokers, protocol.BrokerInfo{
+					NodeID: int32(bi.ID),
+					Host:   bi.Host,
+					Port:   bi.Port,
+				})
+			}
+
+			// Build topic metadata
+			topicNames := req.Topics
+			if len(topicNames) == 0 {
+				for topic := range meta.Assignments {
+					topicNames = append(topicNames, topic)
+				}
+			}
+
+			for _, name := range topicNames {
+				parts, ok := meta.Assignments[name]
+				if !ok {
+					resp.Topics = append(resp.Topics, protocol.TopicMetadata{
+						ErrorCode: protocol.ErrUnknownTopicOrPart,
+						Topic:     name,
+					})
+					continue
+				}
+
+				tm := protocol.TopicMetadata{
+					ErrorCode: protocol.ErrNone,
+					Topic:     name,
+				}
+				for _, pa := range parts {
+					replicas := make([]int32, len(pa.Replicas))
+					for i, r := range pa.Replicas {
+						replicas[i] = int32(r)
+					}
+					isr := make([]int32, len(pa.ISR))
+					for i, r := range pa.ISR {
+						isr[i] = int32(r)
+					}
+					tm.Partitions = append(tm.Partitions, protocol.PartitionMetadata{
+						ErrorCode: protocol.ErrNone,
+						Partition: pa.Partition,
+						Leader:    int32(pa.Leader),
+						Replicas:  replicas,
+						ISR:       isr,
+					})
+				}
+				resp.Topics = append(resp.Topics, tm)
+			}
+
+			return resp
+		}
+	}
+
+	// Single-node mode
 	host, portStr := parseAddr(b.Config.Addr)
 	port, _ := strconv.Atoi(portStr)
 	resp.Brokers = []protocol.BrokerInfo{
-		{NodeID: 0, Host: host, Port: int32(port)},
+		{NodeID: b.GetNodeID(), Host: host, Port: int32(port)},
 	}
 
-	// If no topics specified, return all
 	topicNames := req.Topics
 	if len(topicNames) == 0 {
 		topicNames = b.TopicManager.ListTopics()
 	}
 
+	nodeID := b.GetNodeID()
 	for _, name := range topicNames {
 		topic := b.TopicManager.GetTopic(name)
 		if topic == nil {
@@ -213,9 +347,9 @@ func (b *Broker) HandleMetadata(req *protocol.MetadataRequest) *protocol.Metadat
 			tm.Partitions = append(tm.Partitions, protocol.PartitionMetadata{
 				ErrorCode: protocol.ErrNone,
 				Partition: p.ID,
-				Leader:    0,
-				Replicas:  []int32{0},
-				ISR:       []int32{0},
+				Leader:    nodeID,
+				Replicas:  []int32{nodeID},
+				ISR:       []int32{nodeID},
 			})
 		}
 		resp.Topics = append(resp.Topics, tm)
@@ -238,15 +372,28 @@ func (b *Broker) HandleCreateTopics(req *protocol.CreateTopicsRequest) *protocol
 			numPartitions = b.Config.DefaultPartitions
 		}
 
-		err := b.TopicManager.CreateTopic(topicReq.Topic, numPartitions)
-		if err != nil {
-			if strings.Contains(err.Error(), "already exists") {
-				result.ErrorCode = protocol.ErrTopicAlreadyExists
+		if b.clusterMode && b.controllerClient != nil {
+			err := b.controllerClient.CreateTopic(topicReq.Topic, numPartitions, topicReq.ReplicationFactor)
+			if err != nil {
+				if strings.Contains(err.Error(), "already exists") {
+					result.ErrorCode = protocol.ErrTopicAlreadyExists
+				} else {
+					result.ErrorCode = protocol.ErrUnknown
+				}
 			} else {
-				result.ErrorCode = protocol.ErrUnknown
+				result.ErrorCode = protocol.ErrNone
 			}
 		} else {
-			result.ErrorCode = protocol.ErrNone
+			err := b.TopicManager.CreateTopic(topicReq.Topic, numPartitions)
+			if err != nil {
+				if strings.Contains(err.Error(), "already exists") {
+					result.ErrorCode = protocol.ErrTopicAlreadyExists
+				} else {
+					result.ErrorCode = protocol.ErrUnknown
+				}
+			} else {
+				result.ErrorCode = protocol.ErrNone
+			}
 		}
 
 		resp.Topics = append(resp.Topics, result)
@@ -266,9 +413,13 @@ func (b *Broker) HandleApiVersions(req *protocol.ApiVersionsRequest) *protocol.A
 			{APIKey: protocol.APIKeyFetch, MinVersion: 0, MaxVersion: 4},
 			{APIKey: protocol.APIKeyListOffsets, MinVersion: 0, MaxVersion: 1},
 			{APIKey: protocol.APIKeyMetadata, MinVersion: 0, MaxVersion: 1},
+			{APIKey: protocol.APIKeyOffsetCommit, MinVersion: 0, MaxVersion: 2},
 			{APIKey: protocol.APIKeyOffsetFetch, MinVersion: 0, MaxVersion: 0},
 			{APIKey: protocol.APIKeyFindCoordinator, MinVersion: 0, MaxVersion: 0},
-			{APIKey: protocol.APIKeyJoinGroup, MinVersion: 0, MaxVersion: 0},
+			{APIKey: protocol.APIKeyJoinGroup, MinVersion: 0, MaxVersion: 1},
+			{APIKey: protocol.APIKeyHeartbeat, MinVersion: 0, MaxVersion: 0},
+			{APIKey: protocol.APIKeyLeaveGroup, MinVersion: 0, MaxVersion: 0},
+			{APIKey: protocol.APIKeySyncGroup, MinVersion: 0, MaxVersion: 0},
 			{APIKey: protocol.APIKeyApiVersions, MinVersion: 0, MaxVersion: 2},
 			{APIKey: protocol.APIKeyCreateTopics, MinVersion: 0, MaxVersion: 0},
 		},
@@ -305,7 +456,6 @@ func (b *Broker) HandleListOffsets(req *protocol.ListOffsetsRequest) *protocol.L
 				partResp.Offset = partition.Log.EarliestOffset()
 				partResp.Timestamp = -2
 			default:
-				// For any other timestamp, return the latest offset
 				partResp.Offset = partition.Log.NextOffset()
 				partResp.Timestamp = partData.Timestamp
 			}
@@ -323,42 +473,59 @@ func (b *Broker) HandleListOffsets(req *protocol.ListOffsetsRequest) *protocol.L
 func (b *Broker) HandleFindCoordinator(req *protocol.FindCoordinatorRequest) *protocol.FindCoordinatorResponse {
 	host, portStr := parseAddr(b.Config.Addr)
 	port, _ := strconv.Atoi(portStr)
+
+	if b.clusterMode {
+		meta := b.GetClusterMetadata()
+		if meta != nil {
+			for _, bi := range meta.Brokers {
+				return &protocol.FindCoordinatorResponse{
+					Header:    protocol.ResponseHeader{CorrelationID: req.Header.CorrelationID},
+					ErrorCode: protocol.ErrNone,
+					NodeID:    int32(bi.ID),
+					Host:      bi.Host,
+					Port:      bi.Port,
+				}
+			}
+		}
+	}
+
 	return &protocol.FindCoordinatorResponse{
 		Header:    protocol.ResponseHeader{CorrelationID: req.Header.CorrelationID},
 		ErrorCode: protocol.ErrNone,
-		NodeID:    0,
+		NodeID:    b.GetNodeID(),
 		Host:      host,
 		Port:      int32(port),
 	}
 }
 
-// HandleJoinGroup returns an error since we don't support consumer groups.
+// HandleJoinGroup delegates to the group coordinator.
 func (b *Broker) HandleJoinGroup(req *protocol.JoinGroupRequest) *protocol.JoinGroupResponse {
-	return &protocol.JoinGroupResponse{
-		Header:    protocol.ResponseHeader{CorrelationID: req.Header.CorrelationID},
-		ErrorCode: protocol.ErrGroupCoordinatorNotAvailable,
-	}
+	return b.groupCoordinator.HandleJoinGroup(req)
 }
 
-// HandleOffsetFetch returns committed offset -1 for all partitions (no committed offsets).
+// HandleSyncGroup delegates to the group coordinator.
+func (b *Broker) HandleSyncGroup(req *protocol.SyncGroupRequest) *protocol.SyncGroupResponse {
+	return b.groupCoordinator.HandleSyncGroup(req)
+}
+
+// HandleHeartbeat delegates to the group coordinator.
+func (b *Broker) HandleHeartbeat(req *protocol.HeartbeatRequest) *protocol.HeartbeatResponse {
+	return b.groupCoordinator.HandleHeartbeat(req)
+}
+
+// HandleLeaveGroup delegates to the group coordinator.
+func (b *Broker) HandleLeaveGroup(req *protocol.LeaveGroupRequest) *protocol.LeaveGroupResponse {
+	return b.groupCoordinator.HandleLeaveGroup(req)
+}
+
+// HandleOffsetCommit delegates to the group coordinator.
+func (b *Broker) HandleOffsetCommit(req *protocol.OffsetCommitRequest) *protocol.OffsetCommitResponse {
+	return b.groupCoordinator.HandleOffsetCommit(req)
+}
+
+// HandleOffsetFetch delegates to the group coordinator.
 func (b *Broker) HandleOffsetFetch(req *protocol.OffsetFetchRequest) *protocol.OffsetFetchResponse {
-	resp := &protocol.OffsetFetchResponse{
-		Header: protocol.ResponseHeader{CorrelationID: req.Header.CorrelationID},
-	}
-
-	for _, t := range req.Topics {
-		topicResp := protocol.OffsetFetchTopicResponse{Topic: t.Topic}
-		for _, p := range t.Partitions {
-			topicResp.Partitions = append(topicResp.Partitions, protocol.OffsetFetchPartitionResponse{
-				Partition:       p,
-				CommittedOffset: -1,
-				ErrorCode:       protocol.ErrNone,
-			})
-		}
-		resp.Topics = append(resp.Topics, topicResp)
-	}
-
-	return resp
+	return b.groupCoordinator.HandleOffsetFetch(req)
 }
 
 // Dispatch routes a decoded request to the appropriate handler.
@@ -380,20 +547,17 @@ func (b *Broker) Dispatch(req interface{}) (interface{}, error) {
 		return b.HandleFindCoordinator(r), nil
 	case *protocol.JoinGroupRequest:
 		return b.HandleJoinGroup(r), nil
+	case *protocol.SyncGroupRequest:
+		return b.HandleSyncGroup(r), nil
+	case *protocol.HeartbeatRequest:
+		return b.HandleHeartbeat(r), nil
+	case *protocol.LeaveGroupRequest:
+		return b.HandleLeaveGroup(r), nil
+	case *protocol.OffsetCommitRequest:
+		return b.HandleOffsetCommit(r), nil
 	case *protocol.OffsetFetchRequest:
 		return b.HandleOffsetFetch(r), nil
 	default:
 		return nil, fmt.Errorf("unknown request type: %T", req)
 	}
-}
-
-func parseAddr(addr string) (host, port string) {
-	host, port, err := net.SplitHostPort(addr)
-	if err != nil {
-		return "localhost", "9092"
-	}
-	if host == "" {
-		host = "localhost"
-	}
-	return host, port
 }
